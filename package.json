@@ -1,0 +1,15 @@
+{
+  "name": "bookleaf-royalty-automation",
+  "private": true,
+  "type": "commonjs",
+  "scripts": {
+    "test": "node --test tests/*.test.js",
+    "build": "node n8n/build-workflow.mjs",
+    "seed:dry": "node seed/seed-bubble.mjs --dry-run",
+    "seed": "node seed/seed-bubble.mjs",
+    "csv": "node tools/make-csv.mjs"
+  },
+  "devDependencies": {
+    "@anthropic-ai/sdk": "^1.6.0"
+  }
+}

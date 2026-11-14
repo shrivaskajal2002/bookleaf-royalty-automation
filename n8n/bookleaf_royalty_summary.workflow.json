@@ -1,0 +1,767 @@
+{
+  "name": "BookLeaf: Royalty Summary (AI)",
+  "nodes": [
+    {
+      "parameters": {
+        "content": "## 1. Intake and security\nThe webhook only accepts calls with the **X-BookLeaf-Key** header (Header Auth credential); anything else is rejected by n8n (403).\n\nBubble's free plan blocks inbound API calls, so **Bubble sends the author's full data** (author, books, payouts) in the body and **n8n replies in the same request**. Validate Payload checks every field before any AI spend.\n\n**Idempotency:** a log_id already processed, or a second request for the same author within 2 minutes, is answered **Skipped**.",
+        "width": 1340,
+        "height": 1080,
+        "color": 7
+      },
+      "id": "ef1dc993-a849-cd9e-d72a-29cf8fcf2908",
+      "name": "Note: Intake",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        -60,
+        -200
+      ]
+    },
+    {
+      "parameters": {
+        "content": "## 2. Generate and deliver\nTotals, payout dates and the payout situation are calculated in **Build Royalty Context** (code, not AI). The AI (Gemini free tier by default, or Claude) only writes the wording, as JSON (subject + body). **Parse & Validate** rejects any email that drops a book or total, or quotes an amount that is not in the data, then retries once with the validator's notes. Optional SMTP sends the real email (bonus). The result goes back to Bubble as **Success** with the email text.",
+        "width": 1980,
+        "height": 820,
+        "color": 4
+      },
+      "id": "d70f3988-a268-f270-9bcb-88346477b126",
+      "name": "Note: Generate",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        1300,
+        -200
+      ]
+    },
+    {
+      "parameters": {
+        "content": "## 3. Failure handling\nEvery step after the gate sends its **error output** here. The handler names the failing step, releases the per-author lock, and answers Bubble with **Failed** + a readable reason (and the email text if it was already generated). The run then ends with **Stop and Error**, so the execution shows as failed in n8n and the error workflow alerts ops. Nothing fails silently.",
+        "width": 1980,
+        "height": 400,
+        "color": 3
+      },
+      "id": "0b7288d0-3fa8-59fd-3a77-249f3553e9cb",
+      "name": "Note: Failure",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        1300,
+        640
+      ]
+    },
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "bookleaf-royalty-summary",
+        "authentication": "headerAuth",
+        "responseMode": "responseNode",
+        "options": {}
+      },
+      "id": "3ac2826f-1733-165b-dbb3-e993567a1027",
+      "name": "Webhook",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [
+        0,
+        300
+      ],
+      "webhookId": "65e8114f-13e5-0cc4-5057-ef99b772758e",
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "REPLACE_ME",
+          "name": "BookLeaf Webhook Key"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "// Settings that are not secret. Secrets (Claude API key, SMTP login, webhook key) live in\n// n8n Credentials, so they never show up in this node or in the exported JSON.\nreturn [{\n  json: {\n    // Bubble's free plan blocks inbound API calls, so Bubble sends the author's data in the webhook\n    // body and n8n replies to that same request with the result. No Bubble URL or token is needed.\n    // DATA_TIMEZONE is the time zone the app's dates were entered in, used to read them as calendar dates.\n    DATA_TIMEZONE: 'Asia/Kolkata',\n\n    // 'gemini' = Google Gemini API, free tier (key from aistudio.google.com, no card needed).\n    // 'anthropic' = Claude (set AI_MODEL to 'claude-opus-5-5' or 'claude-haiku-5-5').\n    // The \"AI API Key\" credential must match: header x-goog-api-key (Gemini) or x-api-key (Anthropic).\n    AI_PROVIDER: 'gemini',\n    AI_MODEL: 'gemini-4-hydrogen',\n    AI_EFFORT: 'medium',           // Anthropic only\n    AI_MAX_ATTEMPTS: 2,            // one retry, with the validator's notes, if the first draft fails checks\n\n    // Bonus: actually send the email over SMTP. The dataset's author emails are fake, so while\n    // testing send everything to EMAIL_TEST_RECIPIENT instead (the log still records the real author).\n    SEND_EMAIL: false,\n    EMAIL_FROM: 'BookLeaf Royalties <royalties@example.com>',\n    EMAIL_TEST_RECIPIENT: '',\n\n    // Duplicate protection on the n8n side (Bubble also blocks double clicks, see README).\n    DEDUPE_WINDOW_SECONDS: 120,    // a second request for the same author within this window is Skipped\n    SEEN_LOG_TTL_SECONDS: 3600,    // the same log_id is never processed twice within this window\n\n    // Leave empty to use today's date. Set e.g. '2026-01-10' to demo the \"pending, on schedule\" wording.\n    TODAY_OVERRIDE: '',\n  },\n}];\n"
+      },
+      "id": "8851142d-a56f-d885-ce66-8a165b33fee7",
+      "name": "Config",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        220,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// ---- inlined from n8n/src/lib/bubble.js ----\n/*\n * Helpers for the Bubble <-> n8n contract.\n *\n * Bubble's free plan blocks every inbound API call (Data API, Workflow API, CSV import), so n8n can't\n * read from or call back into Bubble. Instead:\n *   - Bubble sends the author's full data in the webhook body (normalizePayload reads it), and\n *   - n8n answers the same HTTP request with the result (summaryResponse builds it), and Bubble\n *     writes that result into the Notification Log itself.\n * Inlined into Code nodes by build-workflow.mjs, same as royalty.js.\n */\n\n/**\n * A date from Bubble → 'YYYY-MM-DD' as a calendar date in `timeZone`.\n * Bubble stores a moment in time; a date picked in India as 20 Jun is 19 Jun 18:30 UTC, so reading\n * it in UTC would shift it by a day. Accepts Unix milliseconds (Bubble's `:extract UNIX`), ISO strings\n * and plain 'YYYY-MM-DD'.\n */\nfunction localDate(value, timeZone) {\n  if (value === null || value === undefined || value === '') return null;\n  const s = String(value).trim();\n  if (/^\\d{4}-\\d{2}-\\d{2}$/.test(s)) return s;\n  const d = /^-?\\d{9,}$/.test(s) ? new Date(Number(s)) : new Date(s);\n  if (Number.isNaN(d.getTime())) return null;\n  const parts = new Intl.DateTimeFormat('en-CA', { timeZone: timeZone || 'UTC', year: 'numeric', month: '2-digit', day: '2-digit' })\n    .formatToParts(d);\n  const get = (t) => parts.find((p) => p.type === t).value;\n  return `${get('year')}-${get('month')}-${get('day')}`;\n}\n\n/** '' / null → null; '1,234' / '₹1234' / 1234 → 1234. */\nfunction toNum(v) {\n  if (v === null || v === undefined || v === '') return null;\n  if (typeof v === 'number') return Number.isFinite(v) ? v : null;\n  const n = Number(String(v).replace(/[₹,\\s]/g, ''));\n  return Number.isFinite(n) ? n : null;\n}\n\nconst txt = (v) => (v === null || v === undefined ? '' : String(v).trim());\n\n/** Bubble builds lists with :format as text, so a list may arrive as an array or as a JSON string. */\nfunction asArray(v) {\n  if (Array.isArray(v)) return v;\n  if (typeof v === 'string' && v.trim()) {\n    const s = v.trim();\n    try {\n      const parsed = JSON.parse(s.startsWith('[') ? s : `[${s}]`);\n      return Array.isArray(parsed) ? parsed : [parsed];\n    } catch (e) {\n      return null;\n    }\n  }\n  if (v === null || v === undefined || v === '') return [];\n  return null;\n}\n\nconst isBubbleId = (v) => typeof v === 'string' && /^\\d+x\\d+$/.test(v);\n\n/**\n * Reads and checks the webhook body sent by Bubble. Returns the author, books and payouts in the\n * same shape as bookleaf_sample_data.json, so lib/royalty.js works on them unchanged.\n *\n * Expected body (every value may be a string; Bubble's API Connector sends text):\n * {\n *   \"log_id\": \"<NotificationLog unique id>\", \"source\": \"single\" | \"bulk\",\n *   \"author\": { \"id\", \"author_code\", \"name\", \"email\", \"city\" },\n *   \"books\":   [ { \"book_code\", \"title\", \"isbn\", \"genre\", \"stage\", \"publication_date\", \"mrp\",\n *                  \"royalty_per_copy\", \"copies_sold\", \"royalty_earned\", \"royalty_paid\",\n *                  \"royalty_pending\", \"last_payout_date\", \"print_partner\", \"available_on\" } ],\n *   \"payouts\": [ { \"book_title\", \"amount\", \"payout_date\" } ]\n * }\n */\nfunction normalizePayload(body, timeZone) {\n  const errors = [];\n  body = body || {};\n  const a = body.author || {};\n\n  if (!isBubbleId(body.log_id)) errors.push('log_id must be a Bubble unique id');\n  if (!isBubbleId(a.id)) errors.push('author.id must be a Bubble unique id');\n  if (!txt(a.name)) errors.push('author.name is missing');\n  if (!/^[^@\\s]+@[^@\\s]+\\.[^@\\s]+$/.test(txt(a.email))) errors.push('author.email is missing or invalid');\n\n  const rawBooks = asArray(body.books);\n  const rawPayouts = asArray(body.payouts);\n  if (rawBooks === null) errors.push('books must be a list (JSON array)');\n  if (rawPayouts === null) errors.push('payouts must be a list (JSON array)');\n\n  const books = (rawBooks || []).map((b, i) => {\n    const book = {\n      book_id: txt(b.book_code) || null,\n      title: txt(b.title),\n      isbn: txt(b.isbn) || null,\n      genre: txt(b.genre) || null,\n      status: txt(b.stage),\n      publication_date: localDate(b.publication_date, timeZone),\n      mrp: toNum(b.mrp),\n      author_royalty_per_copy: toNum(b.royalty_per_copy),\n      total_copies_sold: toNum(b.copies_sold) ?? 0,\n      total_royalty_earned: toNum(b.royalty_earned) ?? 0,\n      royalty_paid: toNum(b.royalty_paid) ?? 0,\n      royalty_pending: toNum(b.royalty_pending) ?? 0,\n      last_royalty_payout_date: localDate(b.last_payout_date, timeZone),\n      print_partner: txt(b.print_partner) || null,\n      available_on: Array.isArray(b.available_on)\n        ? b.available_on.map(txt).filter(Boolean)\n        : txt(b.available_on).split(',').map((s) => s.trim()).filter(Boolean),\n    };\n    if (!book.title) errors.push(`books[${i}].title is missing`);\n    if (!book.status) errors.push(`books[${i}].stage is missing`);\n    // Guard against a broken Bubble expression sending mismatched money fields.\n    if (Math.abs(book.total_royalty_earned - book.royalty_paid - book.royalty_pending) > 1) {\n      errors.push(`books[${i}] (${book.title}): earned ≠ paid + pending`);\n    }\n    return book;\n  });\n\n  const payouts = (rawPayouts || []).map((p) => ({\n    amount: toNum(p.amount) ?? 0,\n    payout_date: localDate(p.payout_date, timeZone),\n    book_title: txt(p.book_title) || null,\n  }));\n\n  return {\n    errors,\n    log_id: body.log_id || null,\n    source: body.source === 'bulk' ? 'bulk' : 'single',\n    author: { bubble_id: a.id || null, author_id: txt(a.author_code) || null, name: txt(a.name), email: txt(a.email).toLowerCase(), city: txt(a.city) || null },\n    books,\n    payouts,\n  };\n}\n\n/**\n * The one response shape n8n returns to Bubble, for every outcome. Every key is always present\n * (empty string / false when unused) so Bubble's API Connector detects all fields when the call is\n * initialised, and the Bubble workflow can copy them into the Notification Log one to one.\n */\nfunction summaryResponse(fields) {\n  const base = {\n    ok: false,\n    status: 'Failed',            // Success | Failed | Skipped\n    log_id: '',\n    email_subject: '',\n    email_body: '',\n    email_sent: false,\n    recipient: '',\n    error_message: '',\n    failed_step: '',\n    ai_model: '',\n    n8n_execution_id: '',\n    completed_at: new Date().toISOString(),\n  };\n  for (const [k, v] of Object.entries(fields || {})) {\n    if (v !== undefined && v !== null && k in base) base[k] = typeof base[k] === 'string' ? String(v) : v;\n  }\n  return base;\n}\n// ---- end bubble.js ----\n// Steps 1 + 2: check the webhook body and read the author's data from it.\n// The Webhook node has already checked the X-BookLeaf-Key header (Header Auth credential),\n// so anything that reaches this node came from Bubble.\n//\n// Why the full payload instead of querying Bubble's Data API: the Data API is blocked on Bubble's\n// free plan. Bubble already holds exactly the data the author sees, so it sends that.\nconst cfg = $('Config').first().json;\nconst body = $('Webhook').first().json.body || {};\nconst p = normalizePayload(body, cfg.DATA_TIMEZONE);\n\nreturn [{\n  json: {\n    ok: p.errors.length === 0,\n    errors: p.errors,\n    log_id: p.log_id,\n    source: p.source,\n    author: p.author,\n    books: p.books,\n    payouts: p.payouts,\n    received_at: new Date().toISOString(),\n    execution_id: String($execution.id),\n    response: p.errors.length\n      ? summaryResponse({ status: 'Failed', log_id: p.log_id, failed_step: 'Validate Payload', error_message: `Bad request from Bubble: ${p.errors.join('; ')}`, n8n_execution_id: String($execution.id) })\n      : null,\n  },\n}];\n"
+      },
+      "id": "a33a4639-7e6d-d929-cae3-a9e814dbdf5f",
+      "name": "Validate Payload",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        440,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose"
+          },
+          "conditions": [
+            {
+              "id": "1e32c972-ea5e-1d97-acc5-0c1d7fe96913",
+              "leftValue": "={{ $json.ok }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "5a9c734e-7b7c-2c81-52e3-c9bb0f65e651",
+      "name": "Payload Valid?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        660,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ JSON.stringify($json.response) }}",
+        "options": {
+          "responseCode": 200
+        }
+      },
+      "id": "be22bc97-b3b1-0f76-a1c7-74d8e1f269e0",
+      "name": "Respond: Bad Payload (Failed)",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [
+        880,
+        40
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// ---- inlined from n8n/src/lib/bubble.js ----\n/*\n * Helpers for the Bubble <-> n8n contract.\n *\n * Bubble's free plan blocks every inbound API call (Data API, Workflow API, CSV import), so n8n can't\n * read from or call back into Bubble. Instead:\n *   - Bubble sends the author's full data in the webhook body (normalizePayload reads it), and\n *   - n8n answers the same HTTP request with the result (summaryResponse builds it), and Bubble\n *     writes that result into the Notification Log itself.\n * Inlined into Code nodes by build-workflow.mjs, same as royalty.js.\n */\n\n/**\n * A date from Bubble → 'YYYY-MM-DD' as a calendar date in `timeZone`.\n * Bubble stores a moment in time; a date picked in India as 20 Jun is 19 Jun 18:30 UTC, so reading\n * it in UTC would shift it by a day. Accepts Unix milliseconds (Bubble's `:extract UNIX`), ISO strings\n * and plain 'YYYY-MM-DD'.\n */\nfunction localDate(value, timeZone) {\n  if (value === null || value === undefined || value === '') return null;\n  const s = String(value).trim();\n  if (/^\\d{4}-\\d{2}-\\d{2}$/.test(s)) return s;\n  const d = /^-?\\d{9,}$/.test(s) ? new Date(Number(s)) : new Date(s);\n  if (Number.isNaN(d.getTime())) return null;\n  const parts = new Intl.DateTimeFormat('en-CA', { timeZone: timeZone || 'UTC', year: 'numeric', month: '2-digit', day: '2-digit' })\n    .formatToParts(d);\n  const get = (t) => parts.find((p) => p.type === t).value;\n  return `${get('year')}-${get('month')}-${get('day')}`;\n}\n\n/** '' / null → null; '1,234' / '₹1234' / 1234 → 1234. */\nfunction toNum(v) {\n  if (v === null || v === undefined || v === '') return null;\n  if (typeof v === 'number') return Number.isFinite(v) ? v : null;\n  const n = Number(String(v).replace(/[₹,\\s]/g, ''));\n  return Number.isFinite(n) ? n : null;\n}\n\nconst txt = (v) => (v === null || v === undefined ? '' : String(v).trim());\n\n/** Bubble builds lists with :format as text, so a list may arrive as an array or as a JSON string. */\nfunction asArray(v) {\n  if (Array.isArray(v)) return v;\n  if (typeof v === 'string' && v.trim()) {\n    const s = v.trim();\n    try {\n      const parsed = JSON.parse(s.startsWith('[') ? s : `[${s}]`);\n      return Array.isArray(parsed) ? parsed : [parsed];\n    } catch (e) {\n      return null;\n    }\n  }\n  if (v === null || v === undefined || v === '') return [];\n  return null;\n}\n\nconst isBubbleId = (v) => typeof v === 'string' && /^\\d+x\\d+$/.test(v);\n\n/**\n * Reads and checks the webhook body sent by Bubble. Returns the author, books and payouts in the\n * same shape as bookleaf_sample_data.json, so lib/royalty.js works on them unchanged.\n *\n * Expected body (every value may be a string; Bubble's API Connector sends text):\n * {\n *   \"log_id\": \"<NotificationLog unique id>\", \"source\": \"single\" | \"bulk\",\n *   \"author\": { \"id\", \"author_code\", \"name\", \"email\", \"city\" },\n *   \"books\":   [ { \"book_code\", \"title\", \"isbn\", \"genre\", \"stage\", \"publication_date\", \"mrp\",\n *                  \"royalty_per_copy\", \"copies_sold\", \"royalty_earned\", \"royalty_paid\",\n *                  \"royalty_pending\", \"last_payout_date\", \"print_partner\", \"available_on\" } ],\n *   \"payouts\": [ { \"book_title\", \"amount\", \"payout_date\" } ]\n * }\n */\nfunction normalizePayload(body, timeZone) {\n  const errors = [];\n  body = body || {};\n  const a = body.author || {};\n\n  if (!isBubbleId(body.log_id)) errors.push('log_id must be a Bubble unique id');\n  if (!isBubbleId(a.id)) errors.push('author.id must be a Bubble unique id');\n  if (!txt(a.name)) errors.push('author.name is missing');\n  if (!/^[^@\\s]+@[^@\\s]+\\.[^@\\s]+$/.test(txt(a.email))) errors.push('author.email is missing or invalid');\n\n  const rawBooks = asArray(body.books);\n  const rawPayouts = asArray(body.payouts);\n  if (rawBooks === null) errors.push('books must be a list (JSON array)');\n  if (rawPayouts === null) errors.push('payouts must be a list (JSON array)');\n\n  const books = (rawBooks || []).map((b, i) => {\n    const book = {\n      book_id: txt(b.book_code) || null,\n      title: txt(b.title),\n      isbn: txt(b.isbn) || null,\n      genre: txt(b.genre) || null,\n      status: txt(b.stage),\n      publication_date: localDate(b.publication_date, timeZone),\n      mrp: toNum(b.mrp),\n      author_royalty_per_copy: toNum(b.royalty_per_copy),\n      total_copies_sold: toNum(b.copies_sold) ?? 0,\n      total_royalty_earned: toNum(b.royalty_earned) ?? 0,\n      royalty_paid: toNum(b.royalty_paid) ?? 0,\n      royalty_pending: toNum(b.royalty_pending) ?? 0,\n      last_royalty_payout_date: localDate(b.last_payout_date, timeZone),\n      print_partner: txt(b.print_partner) || null,\n      available_on: Array.isArray(b.available_on)\n        ? b.available_on.map(txt).filter(Boolean)\n        : txt(b.available_on).split(',').map((s) => s.trim()).filter(Boolean),\n    };\n    if (!book.title) errors.push(`books[${i}].title is missing`);\n    if (!book.status) errors.push(`books[${i}].stage is missing`);\n    // Guard against a broken Bubble expression sending mismatched money fields.\n    if (Math.abs(book.total_royalty_earned - book.royalty_paid - book.royalty_pending) > 1) {\n      errors.push(`books[${i}] (${book.title}): earned ≠ paid + pending`);\n    }\n    return book;\n  });\n\n  const payouts = (rawPayouts || []).map((p) => ({\n    amount: toNum(p.amount) ?? 0,\n    payout_date: localDate(p.payout_date, timeZone),\n    book_title: txt(p.book_title) || null,\n  }));\n\n  return {\n    errors,\n    log_id: body.log_id || null,\n    source: body.source === 'bulk' ? 'bulk' : 'single',\n    author: { bubble_id: a.id || null, author_id: txt(a.author_code) || null, name: txt(a.name), email: txt(a.email).toLowerCase(), city: txt(a.city) || null },\n    books,\n    payouts,\n  };\n}\n\n/**\n * The one response shape n8n returns to Bubble, for every outcome. Every key is always present\n * (empty string / false when unused) so Bubble's API Connector detects all fields when the call is\n * initialised, and the Bubble workflow can copy them into the Notification Log one to one.\n */\nfunction summaryResponse(fields) {\n  const base = {\n    ok: false,\n    status: 'Failed',            // Success | Failed | Skipped\n    log_id: '',\n    email_subject: '',\n    email_body: '',\n    email_sent: false,\n    recipient: '',\n    error_message: '',\n    failed_step: '',\n    ai_model: '',\n    n8n_execution_id: '',\n    completed_at: new Date().toISOString(),\n  };\n  for (const [k, v] of Object.entries(fields || {})) {\n    if (v !== undefined && v !== null && k in base) base[k] = typeof base[k] === 'string' ? String(v) : v;\n  }\n  return base;\n}\n// ---- end bubble.js ----\n// Step 1b: only one run per request, and only one run per author at a time.\n//\n// Layer 1 (Bubble): the button is disabled while a request is in flight, and the workflow won't\n//   start if this author already has a \"Processing\" log from the last 2 minutes.\n// Layer 2 (here, same log_id): a replayed request for a log already seen is Skipped.\n// Layer 3 (here, per-author lock): two clicks can create two different logs. A short lock skips a\n//   second request for the same author within DEDUPE_WINDOW_SECONDS.\n// State lives in workflow static data. n8n only saves it for active (production) executions,\n// not manual test runs, which is fine: real duplicates come from the live webhook.\nconst cfg = $('Config').first().json;\nconst v = $('Validate Payload').first().json;\n\nconst store = $getWorkflowStaticData('global');\nstore.locks = store.locks || {};\nstore.seen = store.seen || {};\nconst now = Date.now();\nconst lockTtl = Number(cfg.DEDUPE_WINDOW_SECONDS || 120) * 1000;\nconst seenTtl = Number(cfg.SEEN_LOG_TTL_SECONDS || 3600) * 1000;\nfor (const [k, t] of Object.entries(store.locks)) if (now - t > lockTtl) delete store.locks[k];\nfor (const [k, t] of Object.entries(store.seen)) if (now - t > seenTtl) delete store.seen[k];\n\nconst skip = (reason) => [{\n  json: {\n    proceed: false,\n    response: summaryResponse({ status: 'Skipped', log_id: v.log_id, failed_step: 'Idempotency Gate', error_message: reason, n8n_execution_id: v.execution_id }),\n  },\n}];\n\nif (store.seen[v.log_id]) return skip('Duplicate request: this notification log was already processed');\nconst authorKey = v.author.bubble_id;\nif (store.locks[authorKey]) {\n  const ago = Math.round((now - store.locks[authorKey]) / 1000);\n  return skip(`Duplicate request: a summary for ${v.author.name} started ${ago}s ago`);\n}\nstore.seen[v.log_id] = now;\nstore.locks[authorKey] = now;\n\nreturn [{ json: { proceed: true } }];\n"
+      },
+      "id": "442e1bd1-47f8-19e9-9d56-70255a7fea87",
+      "name": "Idempotency Gate",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        880,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose"
+          },
+          "conditions": [
+            {
+              "id": "12b35e37-b171-d53d-9d9d-255568a5e299",
+              "leftValue": "={{ $json.proceed }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "2c98cee8-76be-9de3-9167-1fbed658c605",
+      "name": "Proceed?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        1100,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ JSON.stringify($json.response) }}",
+        "options": {
+          "responseCode": 200
+        }
+      },
+      "id": "787a8c1f-b70a-aa2f-2b22-544ee8bc7e01",
+      "name": "Respond: Duplicate (Skipped)",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [
+        1320,
+        40
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// ---- inlined from n8n/src/lib/royalty.js ----\n/*\n * BookLeaf royalty rules: shared by the n8n Code nodes, the seed script and the tests.\n *\n * Written as plain script code (no import/export) because n8n Code nodes run a\n * function body, not a module. build-workflow.mjs inlines this file into the Code\n * nodes that need it and removes the export block at the bottom.\n *\n * All dates are handled as UTC calendar dates, so the result does not change with\n * the time zone of the n8n host.\n */\n\nconst POLICY = {\n  PAYOUT_WINDOW_DAYS: 45,   // KB: \"paid within 45 days of the quarter ending\"\n  OVERDUE_AFTER_DAYS: 90,   // Assignment: red badge if no payout for > 90 days\n  MIN_PAYOUT_INR: 1000,     // KB: below ₹1,000 royalties roll over to the next quarter\n  ESCALATION_HOURS: 48,     // KB playbook: genuinely overdue → escalate, 48h resolution\n};\n\nconst DAY_MS = 24 * 60 * 60 * 1000;\n\n/** 'YYYY-MM-DD' | ISO string | Date | null → Date at UTC midnight, or null. */\nfunction toDate(value) {\n  if (value === null || value === undefined || value === '') return null;\n  const d = value instanceof Date ? value : new Date(value);\n  if (Number.isNaN(d.getTime())) return null;\n  return new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate()));\n}\n\nfunction addDays(date, days) {\n  return new Date(date.getTime() + days * DAY_MS);\n}\n\nfunction isoDate(date) {\n  return date ? date.toISOString().slice(0, 10) : null;\n}\n\nconst MONTHS = ['January', 'February', 'March', 'April', 'May', 'June', 'July',\n  'August', 'September', 'October', 'November', 'December'];\n\n/** 14 November 2026: written out so the AI copies it and no one misreads 11/14 vs 14/11. */\nfunction fmtDate(date) {\n  if (!date) return null;\n  return `${date.getUTCDate()} ${MONTHS[date.getUTCMonth()]} ${date.getUTCFullYear()}`;\n}\n\n/** ₹11,970 / ₹1,23,456 in Indian digit grouping. Hand-rolled so it does not depend on ICU data on the n8n host. */\nfunction fmtINR(amount) {\n  const n = Math.round(Number(amount) || 0);\n  const sign = n < 0 ? '-' : '';\n  const s = String(Math.abs(n));\n  if (s.length <= 3) return `${sign}₹${s}`;\n  const last3 = s.slice(-3);\n  const rest = s.slice(0, -3).replace(/\\B(?=(\\d{2})+(?!\\d))/g, ',');\n  return `${sign}₹${rest},${last3}`;\n}\n\n/** Last day of the calendar quarter that contains `date`. */\nfunction quarterEnd(date) {\n  const qEndMonth = Math.floor(date.getUTCMonth() / 3) * 3 + 3; // 3, 6, 9, 12\n  return new Date(Date.UTC(date.getUTCFullYear(), qEndMonth, 0)); // day 0 = last day of previous month\n}\n\nfunction previousQuarterEnd(date) {\n  const qStartMonth = Math.floor(date.getUTCMonth() / 3) * 3;\n  return new Date(Date.UTC(date.getUTCFullYear(), qStartMonth, 0));\n}\n\nfunction quarterLabel(qEnd) {\n  return `Q${Math.floor(qEnd.getUTCMonth() / 3) + 1} ${qEnd.getUTCFullYear()}`;\n}\n\n/**\n * Quarterly cycle: royalties for a quarter are paid within 45 days of the quarter ending.\n * If the deadline for the last completed quarter has not passed yet, that deadline is next.\n * Otherwise the next payout is for the current quarter.\n */\nfunction payoutSchedule(today) {\n  const t = toDate(today);\n  const lastQEnd = previousQuarterEnd(t);\n  const lastQDeadline = addDays(lastQEnd, POLICY.PAYOUT_WINDOW_DAYS);\n  const curQEnd = quarterEnd(t);\n  const curQDeadline = addDays(curQEnd, POLICY.PAYOUT_WINDOW_DAYS);\n  const useLast = t.getTime() <= lastQDeadline.getTime();\n  const nextQEnd = useLast ? lastQEnd : curQEnd;\n  const nextDeadline = useLast ? lastQDeadline : curQDeadline;\n  return {\n    today: isoDate(t),\n    next_payout_quarter: quarterLabel(nextQEnd),\n    next_payout_quarter_end: isoDate(nextQEnd),\n    next_payout_deadline: isoDate(nextDeadline),\n    next_payout_deadline_text: fmtDate(nextDeadline),\n    next_payout_quarter_end_text: fmtDate(nextQEnd),\n  };\n}\n\nfunction isPublished(book) {\n  return /published/i.test(String(book.status || ''));\n}\n\nfunction num(v) {\n  const n = Number(v);\n  return Number.isFinite(n) ? n : 0;\n}\n\nfunction authorTotals(books) {\n  return books.reduce((acc, b) => {\n    acc.total_copies_sold += num(b.total_copies_sold);\n    acc.total_earned += num(b.total_royalty_earned);\n    acc.total_paid += num(b.royalty_paid);\n    acc.total_pending += num(b.royalty_pending);\n    return acc;\n  }, { total_books: books.length, total_copies_sold: 0, total_earned: 0, total_paid: 0, total_pending: 0 });\n}\n\n/**\n * The date from which a book's pending royalty counts as overdue, or null if it never will\n * with the current figures.\n *\n * Storing this one date (instead of a status) keeps the status correct over time: the\n * dashboard compares it with \"Current date/time\" when the page is viewed.\n *\n * - No pending amount → null (paid up).\n * - Author's total pending below the ₹1,000 threshold → null. Policy says it rolls over, so it\n *   is not overdue (shown as yellow, \"below payout threshold\").\n * - Paid before → last payout + 90 days.\n * - Never paid and published → publication date + 90 days.\n */\nfunction bookOverdueOn(book, authorTotalPending) {\n  if (num(book.royalty_pending) <= 0) return null;\n  if (num(authorTotalPending) < POLICY.MIN_PAYOUT_INR) return null;\n  const base = toDate(book.last_royalty_payout_date) || (isPublished(book) ? toDate(book.publication_date) : null);\n  return base ? addDays(base, POLICY.OVERDUE_AFTER_DAYS) : null;\n}\n\n/** GREEN | YELLOW | RED | GREY. Same rule as the Bubble badge conditionals. */\nfunction bookBadge(book, authorTotalPending, today) {\n  const t = toDate(today);\n  if (!isPublished(book) && num(book.total_royalty_earned) === 0) return 'GREY';\n  if (num(book.royalty_pending) <= 0) return 'GREEN';\n  const overdueOn = bookOverdueOn(book, authorTotalPending);\n  if (overdueOn && overdueOn.getTime() < t.getTime()) return 'RED';\n  return 'YELLOW';\n}\n\n/** FULLY_PAID | PENDING | OVERDUE (used by the admin filter). */\nfunction authorPayoutStatus(books, today) {\n  const totals = authorTotals(books);\n  if (totals.total_pending <= 0) return 'FULLY_PAID';\n  return books.some((b) => bookBadge(b, totals.total_pending, today) === 'RED') ? 'OVERDUE' : 'PENDING';\n}\n\n/** Earliest overdue_on across the author's books, cached on Author so Bubble can filter on it. */\nfunction authorEarliestOverdueOn(books) {\n  const totals = authorTotals(books);\n  const dates = books.map((b) => bookOverdueOn(b, totals.total_pending)).filter(Boolean);\n  if (!dates.length) return null;\n  return new Date(Math.min(...dates.map((d) => d.getTime())));\n}\n\n/**\n * Turns raw author/book/payout data into the facts sent to the AI.\n *\n * Every number, date and decision is worked out here, in code. The model only writes the\n * wording around these facts, so it cannot get the money or the policy wrong.\n */\nfunction buildAuthorContext(author, books, payouts, today) {\n  const t = toDate(today);\n  const totals = authorTotals(books);\n  const schedule = payoutSchedule(t);\n  const published = books.filter(isPublished);\n  const inProduction = books.filter((b) => !isPublished(b));\n\n  const bookFacts = published.map((b) => {\n    const badge = bookBadge(b, totals.total_pending, t);\n    const lastPayout = toDate(b.last_royalty_payout_date);\n    return {\n      title: b.title,\n      publication_date: fmtDate(toDate(b.publication_date)),\n      copies_sold: num(b.total_copies_sold),\n      royalty_per_copy: fmtINR(b.author_royalty_per_copy),\n      royalty_earned: fmtINR(b.total_royalty_earned),\n      royalty_paid: fmtINR(b.royalty_paid),\n      royalty_pending: fmtINR(b.royalty_pending),\n      last_payout_date: lastPayout ? fmtDate(lastPayout) : 'No payout yet',\n      available_on: (b.available_on || []).join(', '),\n      status: { GREEN: 'Paid up', YELLOW: 'Pending, within normal cycle', RED: 'Overdue' }[badge],\n    };\n  });\n\n  const overdueTitles = published\n    .filter((b) => bookBadge(b, totals.total_pending, t) === 'RED')\n    .map((b) => b.title);\n\n  let situation;\n  if (!published.length) situation = 'NO_PUBLISHED_BOOKS';\n  else if (totals.total_pending <= 0) situation = 'ALL_PAID';\n  else if (totals.total_pending < POLICY.MIN_PAYOUT_INR) situation = 'BELOW_THRESHOLD';\n  else if (overdueTitles.length) situation = 'OVERDUE';\n  else situation = 'PENDING_ON_SCHEDULE';\n\n  const firstName = String(author.name || '').trim().split(/\\s+/)[0] || 'there';\n\n  const history = (payouts || [])\n    .map((p) => ({ date: toDate(p.payout_date), amount: num(p.amount), book: p.book_title || null }))\n    .filter((p) => p.date)\n    .sort((a, b) => b.date - a.date)\n    .slice(0, 5)\n    .map((p) => ({ date: fmtDate(p.date), amount: fmtINR(p.amount), book: p.book }));\n\n  const facts = {\n    today: fmtDate(t),\n    author: { full_name: author.name, first_name: firstName, city: author.city || null },\n    totals: {\n      published_books: published.length,\n      total_copies_sold: totals.total_copies_sold,\n      total_earned: fmtINR(totals.total_earned),\n      total_paid: fmtINR(totals.total_paid),\n      total_pending: fmtINR(totals.total_pending),\n    },\n    published_books: bookFacts,\n    books_in_production: inProduction.map((b) => ({ title: b.title, current_stage: String(b.status || '').replace(/^In Production\\s*-\\s*/i, '') })),\n    recent_payouts: history,\n    payout: {\n      situation,\n      overdue_books: overdueTitles,\n      next_payout_quarter: schedule.next_payout_quarter,\n      next_payout_quarter_end: schedule.next_payout_quarter_end_text,\n      next_payout_deadline: schedule.next_payout_deadline_text,\n      minimum_payout_threshold: fmtINR(POLICY.MIN_PAYOUT_INR),\n      amount_short_of_threshold: totals.total_pending > 0 && totals.total_pending < POLICY.MIN_PAYOUT_INR\n        ? fmtINR(POLICY.MIN_PAYOUT_INR - totals.total_pending) : null,\n      escalation_hours: POLICY.ESCALATION_HOURS,\n    },\n  };\n\n  // Every rupee amount the email is allowed to contain. Parse & Validate rejects any other amount.\n  const allowed = new Set([fmtINR(POLICY.MIN_PAYOUT_INR)]);\n  [facts.totals.total_earned, facts.totals.total_paid, facts.totals.total_pending, facts.payout.amount_short_of_threshold]\n    .filter(Boolean).forEach((a) => allowed.add(a));\n  published.forEach((b) => {\n    ['total_royalty_earned', 'royalty_paid', 'royalty_pending', 'author_royalty_per_copy', 'mrp']\n      .forEach((k) => { if (b[k] !== null && b[k] !== undefined) allowed.add(fmtINR(b[k])); });\n  });\n  history.forEach((p) => allowed.add(p.amount));\n\n  return { facts, allowed_amounts: [...allowed], totals_raw: totals };\n}\n\n/**\n * Checks the AI's email before it goes anywhere. Returns a list of problems (empty = OK).\n * This is a deterministic guard against made-up numbers and missing content.\n */\nfunction validateEmail(email, context) {\n  const problems = [];\n  const subject = String(email && email.subject || '').trim();\n  const body = String(email && email.body || '').trim();\n  const f = context.facts;\n  if (!subject) problems.push('subject is empty');\n  if (subject.length > 150) problems.push('subject longer than 150 characters');\n  if (body.length < 300) problems.push('body is too short');\n  if (body.length > 6000) problems.push('body is too long');\n  if (!body.includes(f.author.first_name)) problems.push(`greeting does not use the author's name (${f.author.first_name})`);\n  if (f.published_books.length) {\n    [f.totals.total_earned, f.totals.total_paid, f.totals.total_pending].forEach((amt) => {\n      if (!body.includes(amt)) problems.push(`required total ${amt} missing from body`);\n    });\n  }\n  f.published_books.forEach((b) => { if (!body.includes(b.title)) problems.push(`published book \"${b.title}\" not mentioned`); });\n  f.books_in_production.forEach((b) => { if (!body.includes(b.title)) problems.push(`in-production book \"${b.title}\" not mentioned`); });\n  if (f.payout.situation === 'PENDING_ON_SCHEDULE' && !body.includes(f.payout.next_payout_deadline)) {\n    problems.push(`next payout date ${f.payout.next_payout_deadline} missing`);\n  }\n  const allowed = new Set(context.allowed_amounts);\n  const found = body.match(/₹\\s?[\\d,]+(?:\\.\\d+)?/g) || [];\n  found.map((a) => a.replace(/\\s/g, '').replace(/\\.0+$/, '')).forEach((a) => {\n    if (!allowed.has(a)) problems.push(`amount ${a} is not in the source data`);\n  });\n  if (/\\[[^\\]]*\\]|\\{\\{|lorem ipsum/i.test(body)) problems.push('body contains a placeholder');\n  return problems;\n}\n// ---- end royalty.js ----\n// ---- inlined from n8n/src/lib/bubble.js ----\n/*\n * Helpers for the Bubble <-> n8n contract.\n *\n * Bubble's free plan blocks every inbound API call (Data API, Workflow API, CSV import), so n8n can't\n * read from or call back into Bubble. Instead:\n *   - Bubble sends the author's full data in the webhook body (normalizePayload reads it), and\n *   - n8n answers the same HTTP request with the result (summaryResponse builds it), and Bubble\n *     writes that result into the Notification Log itself.\n * Inlined into Code nodes by build-workflow.mjs, same as royalty.js.\n */\n\n/**\n * A date from Bubble → 'YYYY-MM-DD' as a calendar date in `timeZone`.\n * Bubble stores a moment in time; a date picked in India as 20 Jun is 19 Jun 18:30 UTC, so reading\n * it in UTC would shift it by a day. Accepts Unix milliseconds (Bubble's `:extract UNIX`), ISO strings\n * and plain 'YYYY-MM-DD'.\n */\nfunction localDate(value, timeZone) {\n  if (value === null || value === undefined || value === '') return null;\n  const s = String(value).trim();\n  if (/^\\d{4}-\\d{2}-\\d{2}$/.test(s)) return s;\n  const d = /^-?\\d{9,}$/.test(s) ? new Date(Number(s)) : new Date(s);\n  if (Number.isNaN(d.getTime())) return null;\n  const parts = new Intl.DateTimeFormat('en-CA', { timeZone: timeZone || 'UTC', year: 'numeric', month: '2-digit', day: '2-digit' })\n    .formatToParts(d);\n  const get = (t) => parts.find((p) => p.type === t).value;\n  return `${get('year')}-${get('month')}-${get('day')}`;\n}\n\n/** '' / null → null; '1,234' / '₹1234' / 1234 → 1234. */\nfunction toNum(v) {\n  if (v === null || v === undefined || v === '') return null;\n  if (typeof v === 'number') return Number.isFinite(v) ? v : null;\n  const n = Number(String(v).replace(/[₹,\\s]/g, ''));\n  return Number.isFinite(n) ? n : null;\n}\n\nconst txt = (v) => (v === null || v === undefined ? '' : String(v).trim());\n\n/** Bubble builds lists with :format as text, so a list may arrive as an array or as a JSON string. */\nfunction asArray(v) {\n  if (Array.isArray(v)) return v;\n  if (typeof v === 'string' && v.trim()) {\n    const s = v.trim();\n    try {\n      const parsed = JSON.parse(s.startsWith('[') ? s : `[${s}]`);\n      return Array.isArray(parsed) ? parsed : [parsed];\n    } catch (e) {\n      return null;\n    }\n  }\n  if (v === null || v === undefined || v === '') return [];\n  return null;\n}\n\nconst isBubbleId = (v) => typeof v === 'string' && /^\\d+x\\d+$/.test(v);\n\n/**\n * Reads and checks the webhook body sent by Bubble. Returns the author, books and payouts in the\n * same shape as bookleaf_sample_data.json, so lib/royalty.js works on them unchanged.\n *\n * Expected body (every value may be a string; Bubble's API Connector sends text):\n * {\n *   \"log_id\": \"<NotificationLog unique id>\", \"source\": \"single\" | \"bulk\",\n *   \"author\": { \"id\", \"author_code\", \"name\", \"email\", \"city\" },\n *   \"books\":   [ { \"book_code\", \"title\", \"isbn\", \"genre\", \"stage\", \"publication_date\", \"mrp\",\n *                  \"royalty_per_copy\", \"copies_sold\", \"royalty_earned\", \"royalty_paid\",\n *                  \"royalty_pending\", \"last_payout_date\", \"print_partner\", \"available_on\" } ],\n *   \"payouts\": [ { \"book_title\", \"amount\", \"payout_date\" } ]\n * }\n */\nfunction normalizePayload(body, timeZone) {\n  const errors = [];\n  body = body || {};\n  const a = body.author || {};\n\n  if (!isBubbleId(body.log_id)) errors.push('log_id must be a Bubble unique id');\n  if (!isBubbleId(a.id)) errors.push('author.id must be a Bubble unique id');\n  if (!txt(a.name)) errors.push('author.name is missing');\n  if (!/^[^@\\s]+@[^@\\s]+\\.[^@\\s]+$/.test(txt(a.email))) errors.push('author.email is missing or invalid');\n\n  const rawBooks = asArray(body.books);\n  const rawPayouts = asArray(body.payouts);\n  if (rawBooks === null) errors.push('books must be a list (JSON array)');\n  if (rawPayouts === null) errors.push('payouts must be a list (JSON array)');\n\n  const books = (rawBooks || []).map((b, i) => {\n    const book = {\n      book_id: txt(b.book_code) || null,\n      title: txt(b.title),\n      isbn: txt(b.isbn) || null,\n      genre: txt(b.genre) || null,\n      status: txt(b.stage),\n      publication_date: localDate(b.publication_date, timeZone),\n      mrp: toNum(b.mrp),\n      author_royalty_per_copy: toNum(b.royalty_per_copy),\n      total_copies_sold: toNum(b.copies_sold) ?? 0,\n      total_royalty_earned: toNum(b.royalty_earned) ?? 0,\n      royalty_paid: toNum(b.royalty_paid) ?? 0,\n      royalty_pending: toNum(b.royalty_pending) ?? 0,\n      last_royalty_payout_date: localDate(b.last_payout_date, timeZone),\n      print_partner: txt(b.print_partner) || null,\n      available_on: Array.isArray(b.available_on)\n        ? b.available_on.map(txt).filter(Boolean)\n        : txt(b.available_on).split(',').map((s) => s.trim()).filter(Boolean),\n    };\n    if (!book.title) errors.push(`books[${i}].title is missing`);\n    if (!book.status) errors.push(`books[${i}].stage is missing`);\n    // Guard against a broken Bubble expression sending mismatched money fields.\n    if (Math.abs(book.total_royalty_earned - book.royalty_paid - book.royalty_pending) > 1) {\n      errors.push(`books[${i}] (${book.title}): earned ≠ paid + pending`);\n    }\n    return book;\n  });\n\n  const payouts = (rawPayouts || []).map((p) => ({\n    amount: toNum(p.amount) ?? 0,\n    payout_date: localDate(p.payout_date, timeZone),\n    book_title: txt(p.book_title) || null,\n  }));\n\n  return {\n    errors,\n    log_id: body.log_id || null,\n    source: body.source === 'bulk' ? 'bulk' : 'single',\n    author: { bubble_id: a.id || null, author_id: txt(a.author_code) || null, name: txt(a.name), email: txt(a.email).toLowerCase(), city: txt(a.city) || null },\n    books,\n    payouts,\n  };\n}\n\n/**\n * The one response shape n8n returns to Bubble, for every outcome. Every key is always present\n * (empty string / false when unused) so Bubble's API Connector detects all fields when the call is\n * initialised, and the Bubble workflow can copy them into the Notification Log one to one.\n */\nfunction summaryResponse(fields) {\n  const base = {\n    ok: false,\n    status: 'Failed',            // Success | Failed | Skipped\n    log_id: '',\n    email_subject: '',\n    email_body: '',\n    email_sent: false,\n    recipient: '',\n    error_message: '',\n    failed_step: '',\n    ai_model: '',\n    n8n_execution_id: '',\n    completed_at: new Date().toISOString(),\n  };\n  for (const [k, v] of Object.entries(fields || {})) {\n    if (v !== undefined && v !== null && k in base) base[k] = typeof base[k] === 'string' ? String(v) : v;\n  }\n  return base;\n}\n// ---- end bubble.js ----\n// ---- inlined from n8n/src/lib/ai.js ----\n/*\n * One small adapter so the workflow can use either AI provider with the same nodes.\n *   AI_PROVIDER 'gemini'    → Google Gemini API (free tier, no card needed; default)\n *   AI_PROVIDER 'anthropic' → Claude Messages API\n * The n8n HTTP node sends { url, body } from buildAiCall with the \"AI API Key\" Header Auth\n * credential (header x-goog-api-key for Gemini, x-api-key for Anthropic).\n * Inlined into Code nodes by build-workflow.mjs, same as royalty.js.\n */\n\nconst EMAIL_FIELDS = {\n  subject: 'Email subject line, under 80 characters',\n  body: 'Plain-text email body, greeting to sign-off',\n};\n\nfunction buildAiCall(cfg, system, userText) {\n  const provider = String(cfg.AI_PROVIDER || 'gemini').toLowerCase();\n  if (provider === 'anthropic') {\n    return {\n      provider,\n      url: 'https://api.anthropic.com/v1/messages',\n      body: {\n        model: cfg.AI_MODEL || 'claude-opus-5-5',\n        max_tokens: 16000,\n        output_config: {\n          effort: cfg.AI_EFFORT || 'medium',\n          format: {\n            type: 'json_schema',\n            schema: {\n              type: 'object',\n              properties: Object.fromEntries(Object.entries(EMAIL_FIELDS).map(([k, d]) => [k, { type: 'string', description: d }])),\n              required: Object.keys(EMAIL_FIELDS),\n              additionalProperties: false,\n            },\n          },\n        },\n        fallbacks: 'default',\n        system,\n        messages: [{ role: 'user', content: userText }],\n      },\n    };\n  }\n  const model = cfg.AI_MODEL || 'gemini-4-hydrogen';\n  return {\n    provider: 'gemini',\n    url: `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent`,\n    body: {\n      systemInstruction: { parts: [{ text: system }] },\n      contents: [{ role: 'user', parts: [{ text: userText }] }],\n      generationConfig: {\n        temperature: 0.4,\n        maxOutputTokens: 8192,\n        responseMimeType: 'application/json',\n        responseSchema: {\n          type: 'OBJECT',\n          properties: Object.fromEntries(Object.entries(EMAIL_FIELDS).map(([k, d]) => [k, { type: 'STRING', description: d }])),\n          required: Object.keys(EMAIL_FIELDS),\n          propertyOrdering: Object.keys(EMAIL_FIELDS),\n        },\n      },\n    },\n  };\n}\n\n/**\n * Normalises either provider's response to { outcome, text, model, usage }.\n * outcome: 'ok' | 'refused' (policy/safety block: don't retry) | 'truncated' (hit the token limit) | 'empty'\n */\nfunction parseAiResponse(res) {\n  res = res || {};\n  if (Array.isArray(res.candidates) || res.promptFeedback) {\n    const c = (res.candidates || [])[0];\n    const model = res.modelVersion || 'gemini';\n    if (!c) {\n      return { outcome: res.promptFeedback && res.promptFeedback.blockReason ? 'refused' : 'empty', text: '', model, usage: res.usageMetadata || null };\n    }\n    const text = ((c.content && c.content.parts) || []).map((p) => p.text || '').join('');\n    const reason = c.finishReason || 'STOP';\n    let outcome = 'ok';\n    if (['SAFETY', 'RECITATION', 'BLOCKLIST', 'PROHIBITED_CONTENT', 'SPII'].includes(reason)) outcome = 'refused';\n    else if (reason === 'MAX_TOKENS') outcome = 'truncated';\n    else if (!text) outcome = 'empty';\n    return { outcome, text, model, usage: res.usageMetadata || null };\n  }\n  const text = (res.content || []).filter((b) => b.type === 'text').map((b) => b.text).join('');\n  let outcome = 'ok';\n  if (res.stop_reason === 'refusal') outcome = 'refused';\n  else if (res.stop_reason === 'max_tokens') outcome = 'truncated';\n  else if (!text) outcome = 'empty';\n  return { outcome, text, model: res.model || 'claude', usage: res.usage || null };\n}\n// ---- end ai.js ----\n// Step 2b: turn the author's records (sent by Bubble) into facts and build the AI request.\n// All numbers, dates and the payout situation are worked out here, in code (see lib/royalty.js).\n// The model only writes the wording.\nconst cfg = $('Config').first().json;\nconst v = $('Validate Payload').first().json;\nconst { author, books, payouts } = v;\n\n// \"Today\" in BookLeaf's time zone: n8n Cloud runs on UTC, which is still yesterday until 05:30 IST.\nconst today = cfg.TODAY_OVERRIDE || localDate(new Date().toISOString(), cfg.DATA_TIMEZONE);\nconst context = buildAuthorContext(author, books, payouts, today);\n\nconst SYSTEM_PROMPT = \"You write royalty summary emails to authors on behalf of BookLeaf Publishing. Each email is sent to one author and should be something they are glad to receive: clear about their money, honest about any delay, and warm without being salesy.\\n\\nYou will receive a JSON object of facts about one author. Everything in it is already calculated and checked against BookLeaf's records. Your job is the wording, not the arithmetic.\\n\\n<facts_rules>\\n- Use only the facts provided. Copy names, book titles, dates and amounts exactly as written in the JSON, including the ₹ symbol and comma grouping (for example \\\"₹13,024\\\").\\n- Do not calculate new numbers. Do not add, subtract, convert or round amounts, and do not invent percentages, per-platform sales, bank details, ticket numbers, phone numbers or email addresses. If a figure is not in the JSON, leave it out.\\n- Dates are already written out (\\\"14 November 2026\\\"). Use them as given.\\n</facts_rules>\\n\\n<what_the_email_contains>\\n1. A greeting using the author's first name.\\n2. One short paragraph per published book: title, copies sold, royalty earned, paid and pending, and the last payout date (\\\"No payout yet\\\" means none has been made).\\n3. A clear breakdown of the totals across all books: total earned, total paid, total pending. Put these three figures on separate lines so they are easy to scan.\\n4. What happens next with the money, based on `payout.situation`:\\n   - PENDING_ON_SCHEDULE: royalties are calculated quarterly and paid within 45 days of the quarter ending. Tell them the pending amount is expected by `payout.next_payout_deadline` (for the quarter ending `payout.next_payout_quarter_end`), by bank transfer to the account linked in their dashboard.\\n   - OVERDUE: the payout for the books in `payout.overdue_books` is later than it should be. Say so plainly and own it on BookLeaf's behalf. Do not blame the author, the bank or partners, and do not use vague language like \\\"processing delays\\\". Say the case has been escalated to the finance team and that they will hear back within `payout.escalation_hours` hours. Also ask them to check that their bank details in the dashboard are up to date, phrased as a helpful check, not as a cause.\\n   - BELOW_THRESHOLD: the pending amount is below the `payout.minimum_payout_threshold` minimum payout, so it rolls over to the next quarter and nothing is lost. Mention `payout.amount_short_of_threshold` if present. Keep this positive.\\n   - ALL_PAID: acknowledge warmly that every rupee earned so far has been paid out, and thank them.\\n   - NO_PUBLISHED_BOOKS: no royalties have been earned yet because nothing is on sale yet. Focus on the production update.\\n5. If `books_in_production` is not empty: a brief status update for each book, naming its current stage. Production stages run Manuscript Received → Editing → Cover Design → Typesetting → Proofreading → ISBN Assignment → Printing → Distribution Setup → Published & Live. Say BookLeaf will email them at each stage. Do not promise a publication date.\\n6. A short, warm closing with one clear next step (for example: reply to this email with any questions, or view the detailed breakdown in the BookLeaf dashboard). Sign off as \\\"The BookLeaf Team\\\".\\n</what_the_email_contains>\\n\\n<tone>\\n- Empathetic and professional. Authors are partners, not customers to be managed.\\n- Be specific. Use the actual numbers, dates and statuses instead of vague reassurance.\\n- If something is BookLeaf's fault, such as a delayed royalty payout, own it directly. No corporate deflection.\\n- When something needs follow-up, give a clear timeline, never an open-ended promise.\\n- Celebrate real milestones (strong sales, all paid up) without exaggeration.\\n</tone>\\n\\n<format>\\n- Plain text only: no Markdown, no asterisks, no HTML. Use blank lines between paragraphs and simple \\\"-\\\" bullets where a list helps.\\n- 180 to 400 words in the body.\\n- The subject line should be specific and under 80 characters, for example \\\"Your BookLeaf royalty summary: ₹13,024 pending\\\". Do not put an amount in the subject unless it is copied exactly from the facts.\\n</format>\\n\\n<bookleaf_policy reference=\\\"Knowledge Base, Assignment 1\\\">\\n- BookLeaf Publishing is a self-publishing company operating in India and the US. BookLeaf handles cover design, typesetting, ISBN assignment, printing, distribution and royalty management.\\n- Royalties: 80/20 split, with 80% of net profit per book to the author. Net profit = MRP minus printing cost, platform commission (Amazon/Flipkart) and shipping.\\n- Royalties are calculated quarterly and paid within 45 days of the quarter ending.\\n- The minimum payout is ₹1,000. Below that, royalties roll over to the next quarter.\\n- Payouts are made by bank transfer to the account linked in the author's dashboard. Authors can see a detailed royalty breakdown, including sales per platform, in their dashboard.\\n- Authors are updated by email at each production stage.\\n- A genuinely overdue royalty is escalated with a 48-hour resolution timeline.\\n</bookleaf_policy>\";\nconst userText = `Write the royalty summary email for this author.\\n\\n<facts>\\n${JSON.stringify(context.facts, null, 2)}\\n</facts>`;\nconst call = buildAiCall(cfg, SYSTEM_PROMPT, userText);\n\nreturn [{\n  json: {\n    url: call.url,\n    request: call.body,\n    provider: call.provider,\n    system: SYSTEM_PROMPT,\n    user_text: userText,\n    context,\n    author_email: author.email,\n    author_name: author.name,\n  },\n}];\n"
+      },
+      "id": "b8e28976-5829-6216-d397-7d12f8267d8c",
+      "name": "Build Royalty Context",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1400,
+        300
+      ],
+      "onError": "continueErrorOutput"
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $json.url }}",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "anthropic-version",
+              "value": "2026-10-21"
+            },
+            {
+              "name": "anthropic-beta",
+              "value": "server-side-fallback-2026-07-01"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify($json.request) }}",
+        "options": {
+          "timeout": 60000
+        }
+      },
+      "id": "bb739076-455a-b290-d824-d919ee550de9",
+      "name": "AI: Generate Email",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1620,
+        300
+      ],
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "REPLACE_ME",
+          "name": "AI API Key"
+        }
+      },
+      "retryOnFail": true,
+      "maxTries": 2,
+      "waitBetweenTries": 3000,
+      "onError": "continueErrorOutput"
+    },
+    {
+      "parameters": {
+        "jsCode": "// ---- inlined from n8n/src/lib/royalty.js ----\n/*\n * BookLeaf royalty rules: shared by the n8n Code nodes, the seed script and the tests.\n *\n * Written as plain script code (no import/export) because n8n Code nodes run a\n * function body, not a module. build-workflow.mjs inlines this file into the Code\n * nodes that need it and removes the export block at the bottom.\n *\n * All dates are handled as UTC calendar dates, so the result does not change with\n * the time zone of the n8n host.\n */\n\nconst POLICY = {\n  PAYOUT_WINDOW_DAYS: 45,   // KB: \"paid within 45 days of the quarter ending\"\n  OVERDUE_AFTER_DAYS: 90,   // Assignment: red badge if no payout for > 90 days\n  MIN_PAYOUT_INR: 1000,     // KB: below ₹1,000 royalties roll over to the next quarter\n  ESCALATION_HOURS: 48,     // KB playbook: genuinely overdue → escalate, 48h resolution\n};\n\nconst DAY_MS = 24 * 60 * 60 * 1000;\n\n/** 'YYYY-MM-DD' | ISO string | Date | null → Date at UTC midnight, or null. */\nfunction toDate(value) {\n  if (value === null || value === undefined || value === '') return null;\n  const d = value instanceof Date ? value : new Date(value);\n  if (Number.isNaN(d.getTime())) return null;\n  return new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate()));\n}\n\nfunction addDays(date, days) {\n  return new Date(date.getTime() + days * DAY_MS);\n}\n\nfunction isoDate(date) {\n  return date ? date.toISOString().slice(0, 10) : null;\n}\n\nconst MONTHS = ['January', 'February', 'March', 'April', 'May', 'June', 'July',\n  'August', 'September', 'October', 'November', 'December'];\n\n/** 14 November 2026: written out so the AI copies it and no one misreads 11/14 vs 14/11. */\nfunction fmtDate(date) {\n  if (!date) return null;\n  return `${date.getUTCDate()} ${MONTHS[date.getUTCMonth()]} ${date.getUTCFullYear()}`;\n}\n\n/** ₹11,970 / ₹1,23,456 in Indian digit grouping. Hand-rolled so it does not depend on ICU data on the n8n host. */\nfunction fmtINR(amount) {\n  const n = Math.round(Number(amount) || 0);\n  const sign = n < 0 ? '-' : '';\n  const s = String(Math.abs(n));\n  if (s.length <= 3) return `${sign}₹${s}`;\n  const last3 = s.slice(-3);\n  const rest = s.slice(0, -3).replace(/\\B(?=(\\d{2})+(?!\\d))/g, ',');\n  return `${sign}₹${rest},${last3}`;\n}\n\n/** Last day of the calendar quarter that contains `date`. */\nfunction quarterEnd(date) {\n  const qEndMonth = Math.floor(date.getUTCMonth() / 3) * 3 + 3; // 3, 6, 9, 12\n  return new Date(Date.UTC(date.getUTCFullYear(), qEndMonth, 0)); // day 0 = last day of previous month\n}\n\nfunction previousQuarterEnd(date) {\n  const qStartMonth = Math.floor(date.getUTCMonth() / 3) * 3;\n  return new Date(Date.UTC(date.getUTCFullYear(), qStartMonth, 0));\n}\n\nfunction quarterLabel(qEnd) {\n  return `Q${Math.floor(qEnd.getUTCMonth() / 3) + 1} ${qEnd.getUTCFullYear()}`;\n}\n\n/**\n * Quarterly cycle: royalties for a quarter are paid within 45 days of the quarter ending.\n * If the deadline for the last completed quarter has not passed yet, that deadline is next.\n * Otherwise the next payout is for the current quarter.\n */\nfunction payoutSchedule(today) {\n  const t = toDate(today);\n  const lastQEnd = previousQuarterEnd(t);\n  const lastQDeadline = addDays(lastQEnd, POLICY.PAYOUT_WINDOW_DAYS);\n  const curQEnd = quarterEnd(t);\n  const curQDeadline = addDays(curQEnd, POLICY.PAYOUT_WINDOW_DAYS);\n  const useLast = t.getTime() <= lastQDeadline.getTime();\n  const nextQEnd = useLast ? lastQEnd : curQEnd;\n  const nextDeadline = useLast ? lastQDeadline : curQDeadline;\n  return {\n    today: isoDate(t),\n    next_payout_quarter: quarterLabel(nextQEnd),\n    next_payout_quarter_end: isoDate(nextQEnd),\n    next_payout_deadline: isoDate(nextDeadline),\n    next_payout_deadline_text: fmtDate(nextDeadline),\n    next_payout_quarter_end_text: fmtDate(nextQEnd),\n  };\n}\n\nfunction isPublished(book) {\n  return /published/i.test(String(book.status || ''));\n}\n\nfunction num(v) {\n  const n = Number(v);\n  return Number.isFinite(n) ? n : 0;\n}\n\nfunction authorTotals(books) {\n  return books.reduce((acc, b) => {\n    acc.total_copies_sold += num(b.total_copies_sold);\n    acc.total_earned += num(b.total_royalty_earned);\n    acc.total_paid += num(b.royalty_paid);\n    acc.total_pending += num(b.royalty_pending);\n    return acc;\n  }, { total_books: books.length, total_copies_sold: 0, total_earned: 0, total_paid: 0, total_pending: 0 });\n}\n\n/**\n * The date from which a book's pending royalty counts as overdue, or null if it never will\n * with the current figures.\n *\n * Storing this one date (instead of a status) keeps the status correct over time: the\n * dashboard compares it with \"Current date/time\" when the page is viewed.\n *\n * - No pending amount → null (paid up).\n * - Author's total pending below the ₹1,000 threshold → null. Policy says it rolls over, so it\n *   is not overdue (shown as yellow, \"below payout threshold\").\n * - Paid before → last payout + 90 days.\n * - Never paid and published → publication date + 90 days.\n */\nfunction bookOverdueOn(book, authorTotalPending) {\n  if (num(book.royalty_pending) <= 0) return null;\n  if (num(authorTotalPending) < POLICY.MIN_PAYOUT_INR) return null;\n  const base = toDate(book.last_royalty_payout_date) || (isPublished(book) ? toDate(book.publication_date) : null);\n  return base ? addDays(base, POLICY.OVERDUE_AFTER_DAYS) : null;\n}\n\n/** GREEN | YELLOW | RED | GREY. Same rule as the Bubble badge conditionals. */\nfunction bookBadge(book, authorTotalPending, today) {\n  const t = toDate(today);\n  if (!isPublished(book) && num(book.total_royalty_earned) === 0) return 'GREY';\n  if (num(book.royalty_pending) <= 0) return 'GREEN';\n  const overdueOn = bookOverdueOn(book, authorTotalPending);\n  if (overdueOn && overdueOn.getTime() < t.getTime()) return 'RED';\n  return 'YELLOW';\n}\n\n/** FULLY_PAID | PENDING | OVERDUE (used by the admin filter). */\nfunction authorPayoutStatus(books, today) {\n  const totals = authorTotals(books);\n  if (totals.total_pending <= 0) return 'FULLY_PAID';\n  return books.some((b) => bookBadge(b, totals.total_pending, today) === 'RED') ? 'OVERDUE' : 'PENDING';\n}\n\n/** Earliest overdue_on across the author's books, cached on Author so Bubble can filter on it. */\nfunction authorEarliestOverdueOn(books) {\n  const totals = authorTotals(books);\n  const dates = books.map((b) => bookOverdueOn(b, totals.total_pending)).filter(Boolean);\n  if (!dates.length) return null;\n  return new Date(Math.min(...dates.map((d) => d.getTime())));\n}\n\n/**\n * Turns raw author/book/payout data into the facts sent to the AI.\n *\n * Every number, date and decision is worked out here, in code. The model only writes the\n * wording around these facts, so it cannot get the money or the policy wrong.\n */\nfunction buildAuthorContext(author, books, payouts, today) {\n  const t = toDate(today);\n  const totals = authorTotals(books);\n  const schedule = payoutSchedule(t);\n  const published = books.filter(isPublished);\n  const inProduction = books.filter((b) => !isPublished(b));\n\n  const bookFacts = published.map((b) => {\n    const badge = bookBadge(b, totals.total_pending, t);\n    const lastPayout = toDate(b.last_royalty_payout_date);\n    return {\n      title: b.title,\n      publication_date: fmtDate(toDate(b.publication_date)),\n      copies_sold: num(b.total_copies_sold),\n      royalty_per_copy: fmtINR(b.author_royalty_per_copy),\n      royalty_earned: fmtINR(b.total_royalty_earned),\n      royalty_paid: fmtINR(b.royalty_paid),\n      royalty_pending: fmtINR(b.royalty_pending),\n      last_payout_date: lastPayout ? fmtDate(lastPayout) : 'No payout yet',\n      available_on: (b.available_on || []).join(', '),\n      status: { GREEN: 'Paid up', YELLOW: 'Pending, within normal cycle', RED: 'Overdue' }[badge],\n    };\n  });\n\n  const overdueTitles = published\n    .filter((b) => bookBadge(b, totals.total_pending, t) === 'RED')\n    .map((b) => b.title);\n\n  let situation;\n  if (!published.length) situation = 'NO_PUBLISHED_BOOKS';\n  else if (totals.total_pending <= 0) situation = 'ALL_PAID';\n  else if (totals.total_pending < POLICY.MIN_PAYOUT_INR) situation = 'BELOW_THRESHOLD';\n  else if (overdueTitles.length) situation = 'OVERDUE';\n  else situation = 'PENDING_ON_SCHEDULE';\n\n  const firstName = String(author.name || '').trim().split(/\\s+/)[0] || 'there';\n\n  const history = (payouts || [])\n    .map((p) => ({ date: toDate(p.payout_date), amount: num(p.amount), book: p.book_title || null }))\n    .filter((p) => p.date)\n    .sort((a, b) => b.date - a.date)\n    .slice(0, 5)\n    .map((p) => ({ date: fmtDate(p.date), amount: fmtINR(p.amount), book: p.book }));\n\n  const facts = {\n    today: fmtDate(t),\n    author: { full_name: author.name, first_name: firstName, city: author.city || null },\n    totals: {\n      published_books: published.length,\n      total_copies_sold: totals.total_copies_sold,\n      total_earned: fmtINR(totals.total_earned),\n      total_paid: fmtINR(totals.total_paid),\n      total_pending: fmtINR(totals.total_pending),\n    },\n    published_books: bookFacts,\n    books_in_production: inProduction.map((b) => ({ title: b.title, current_stage: String(b.status || '').replace(/^In Production\\s*-\\s*/i, '') })),\n    recent_payouts: history,\n    payout: {\n      situation,\n      overdue_books: overdueTitles,\n      next_payout_quarter: schedule.next_payout_quarter,\n      next_payout_quarter_end: schedule.next_payout_quarter_end_text,\n      next_payout_deadline: schedule.next_payout_deadline_text,\n      minimum_payout_threshold: fmtINR(POLICY.MIN_PAYOUT_INR),\n      amount_short_of_threshold: totals.total_pending > 0 && totals.total_pending < POLICY.MIN_PAYOUT_INR\n        ? fmtINR(POLICY.MIN_PAYOUT_INR - totals.total_pending) : null,\n      escalation_hours: POLICY.ESCALATION_HOURS,\n    },\n  };\n\n  // Every rupee amount the email is allowed to contain. Parse & Validate rejects any other amount.\n  const allowed = new Set([fmtINR(POLICY.MIN_PAYOUT_INR)]);\n  [facts.totals.total_earned, facts.totals.total_paid, facts.totals.total_pending, facts.payout.amount_short_of_threshold]\n    .filter(Boolean).forEach((a) => allowed.add(a));\n  published.forEach((b) => {\n    ['total_royalty_earned', 'royalty_paid', 'royalty_pending', 'author_royalty_per_copy', 'mrp']\n      .forEach((k) => { if (b[k] !== null && b[k] !== undefined) allowed.add(fmtINR(b[k])); });\n  });\n  history.forEach((p) => allowed.add(p.amount));\n\n  return { facts, allowed_amounts: [...allowed], totals_raw: totals };\n}\n\n/**\n * Checks the AI's email before it goes anywhere. Returns a list of problems (empty = OK).\n * This is a deterministic guard against made-up numbers and missing content.\n */\nfunction validateEmail(email, context) {\n  const problems = [];\n  const subject = String(email && email.subject || '').trim();\n  const body = String(email && email.body || '').trim();\n  const f = context.facts;\n  if (!subject) problems.push('subject is empty');\n  if (subject.length > 150) problems.push('subject longer than 150 characters');\n  if (body.length < 300) problems.push('body is too short');\n  if (body.length > 6000) problems.push('body is too long');\n  if (!body.includes(f.author.first_name)) problems.push(`greeting does not use the author's name (${f.author.first_name})`);\n  if (f.published_books.length) {\n    [f.totals.total_earned, f.totals.total_paid, f.totals.total_pending].forEach((amt) => {\n      if (!body.includes(amt)) problems.push(`required total ${amt} missing from body`);\n    });\n  }\n  f.published_books.forEach((b) => { if (!body.includes(b.title)) problems.push(`published book \"${b.title}\" not mentioned`); });\n  f.books_in_production.forEach((b) => { if (!body.includes(b.title)) problems.push(`in-production book \"${b.title}\" not mentioned`); });\n  if (f.payout.situation === 'PENDING_ON_SCHEDULE' && !body.includes(f.payout.next_payout_deadline)) {\n    problems.push(`next payout date ${f.payout.next_payout_deadline} missing`);\n  }\n  const allowed = new Set(context.allowed_amounts);\n  const found = body.match(/₹\\s?[\\d,]+(?:\\.\\d+)?/g) || [];\n  found.map((a) => a.replace(/\\s/g, '').replace(/\\.0+$/, '')).forEach((a) => {\n    if (!allowed.has(a)) problems.push(`amount ${a} is not in the source data`);\n  });\n  if (/\\[[^\\]]*\\]|\\{\\{|lorem ipsum/i.test(body)) problems.push('body contains a placeholder');\n  return problems;\n}\n// ---- end royalty.js ----\n// ---- inlined from n8n/src/lib/ai.js ----\n/*\n * One small adapter so the workflow can use either AI provider with the same nodes.\n *   AI_PROVIDER 'gemini'    → Google Gemini API (free tier, no card needed; default)\n *   AI_PROVIDER 'anthropic' → Claude Messages API\n * The n8n HTTP node sends { url, body } from buildAiCall with the \"AI API Key\" Header Auth\n * credential (header x-goog-api-key for Gemini, x-api-key for Anthropic).\n * Inlined into Code nodes by build-workflow.mjs, same as royalty.js.\n */\n\nconst EMAIL_FIELDS = {\n  subject: 'Email subject line, under 80 characters',\n  body: 'Plain-text email body, greeting to sign-off',\n};\n\nfunction buildAiCall(cfg, system, userText) {\n  const provider = String(cfg.AI_PROVIDER || 'gemini').toLowerCase();\n  if (provider === 'anthropic') {\n    return {\n      provider,\n      url: 'https://api.anthropic.com/v1/messages',\n      body: {\n        model: cfg.AI_MODEL || 'claude-opus-5-5',\n        max_tokens: 16000,\n        output_config: {\n          effort: cfg.AI_EFFORT || 'medium',\n          format: {\n            type: 'json_schema',\n            schema: {\n              type: 'object',\n              properties: Object.fromEntries(Object.entries(EMAIL_FIELDS).map(([k, d]) => [k, { type: 'string', description: d }])),\n              required: Object.keys(EMAIL_FIELDS),\n              additionalProperties: false,\n            },\n          },\n        },\n        fallbacks: 'default',\n        system,\n        messages: [{ role: 'user', content: userText }],\n      },\n    };\n  }\n  const model = cfg.AI_MODEL || 'gemini-4-hydrogen';\n  return {\n    provider: 'gemini',\n    url: `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent`,\n    body: {\n      systemInstruction: { parts: [{ text: system }] },\n      contents: [{ role: 'user', parts: [{ text: userText }] }],\n      generationConfig: {\n        temperature: 0.4,\n        maxOutputTokens: 8192,\n        responseMimeType: 'application/json',\n        responseSchema: {\n          type: 'OBJECT',\n          properties: Object.fromEntries(Object.entries(EMAIL_FIELDS).map(([k, d]) => [k, { type: 'STRING', description: d }])),\n          required: Object.keys(EMAIL_FIELDS),\n          propertyOrdering: Object.keys(EMAIL_FIELDS),\n        },\n      },\n    },\n  };\n}\n\n/**\n * Normalises either provider's response to { outcome, text, model, usage }.\n * outcome: 'ok' | 'refused' (policy/safety block: don't retry) | 'truncated' (hit the token limit) | 'empty'\n */\nfunction parseAiResponse(res) {\n  res = res || {};\n  if (Array.isArray(res.candidates) || res.promptFeedback) {\n    const c = (res.candidates || [])[0];\n    const model = res.modelVersion || 'gemini';\n    if (!c) {\n      return { outcome: res.promptFeedback && res.promptFeedback.blockReason ? 'refused' : 'empty', text: '', model, usage: res.usageMetadata || null };\n    }\n    const text = ((c.content && c.content.parts) || []).map((p) => p.text || '').join('');\n    const reason = c.finishReason || 'STOP';\n    let outcome = 'ok';\n    if (['SAFETY', 'RECITATION', 'BLOCKLIST', 'PROHIBITED_CONTENT', 'SPII'].includes(reason)) outcome = 'refused';\n    else if (reason === 'MAX_TOKENS') outcome = 'truncated';\n    else if (!text) outcome = 'empty';\n    return { outcome, text, model, usage: res.usageMetadata || null };\n  }\n  const text = (res.content || []).filter((b) => b.type === 'text').map((b) => b.text).join('');\n  let outcome = 'ok';\n  if (res.stop_reason === 'refusal') outcome = 'refused';\n  else if (res.stop_reason === 'max_tokens') outcome = 'truncated';\n  else if (!text) outcome = 'empty';\n  return { outcome, text, model: res.model || 'claude', usage: res.usage || null };\n}\n// ---- end ai.js ----\n// Step 3b: read the AI's answer and check it before it is sent or saved.\n// The validator rejects emails that drop a book, miss a required total, or contain an amount\n// that is not in the source data.\nconst cfg = $('Config').first().json;\nconst ctxNode = $('Build Royalty Context').first().json;\nconst ai = parseAiResponse($input.first().json);\nconst attempt = $('Build Retry Request').isExecuted ? 2 : 1;\n\nconst result = (fields) => [{ json: { attempt, max_attempts: Number(cfg.AI_MAX_ATTEMPTS || 2), ...fields } }];\n\nif (ai.outcome === 'refused') {\n  return result({ ok: false, retryable: false, reason: 'The AI declined the request (safety/policy block)' });\n}\nif (ai.outcome === 'truncated') {\n  return result({ ok: false, retryable: true, reason: 'The AI output was cut off (token limit)' });\n}\nif (ai.outcome === 'empty') {\n  return result({ ok: false, retryable: true, reason: 'The AI returned an empty answer' });\n}\n\nlet email;\ntry {\n  email = JSON.parse(ai.text);\n} catch (e) {\n  return result({ ok: false, retryable: true, reason: 'The AI output was not valid JSON', draft: ai.text });\n}\n\nconst problems = validateEmail(email, ctxNode.context);\nif (problems.length) {\n  return result({ ok: false, retryable: true, reason: `The AI email failed validation: ${problems.join('; ')}`, problems, draft: email });\n}\n\nreturn result({\n  ok: true,\n  subject: email.subject.trim(),\n  body: email.body.trim(),\n  recipient: cfg.EMAIL_TEST_RECIPIENT || ctxNode.author_email,\n  intended_recipient: ctxNode.author_email,\n  model: ai.model,\n  usage: ai.usage,\n});\n"
+      },
+      "id": "b0559428-810b-ec30-3142-02a7b6563293",
+      "name": "Parse & Validate Email",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1840,
+        300
+      ],
+      "onError": "continueErrorOutput"
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose"
+          },
+          "conditions": [
+            {
+              "id": "f46890fb-631c-5fa7-df7c-7bd0d4b97831",
+              "leftValue": "={{ $json.ok }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "0b177a42-470d-2281-f770-435b11434bf6",
+      "name": "Email Valid?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        2060,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose"
+          },
+          "conditions": [
+            {
+              "id": "1c3f769a-593b-c77c-d681-2891bbcbd04c",
+              "leftValue": "={{ $json.retryable && $json.attempt < $json.max_attempts }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "2d0aa5a4-c753-9300-b1bd-1b7be8f18360",
+      "name": "Retry AI?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        2060,
+        520
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// ---- inlined from n8n/src/lib/ai.js ----\n/*\n * One small adapter so the workflow can use either AI provider with the same nodes.\n *   AI_PROVIDER 'gemini'    → Google Gemini API (free tier, no card needed; default)\n *   AI_PROVIDER 'anthropic' → Claude Messages API\n * The n8n HTTP node sends { url, body } from buildAiCall with the \"AI API Key\" Header Auth\n * credential (header x-goog-api-key for Gemini, x-api-key for Anthropic).\n * Inlined into Code nodes by build-workflow.mjs, same as royalty.js.\n */\n\nconst EMAIL_FIELDS = {\n  subject: 'Email subject line, under 80 characters',\n  body: 'Plain-text email body, greeting to sign-off',\n};\n\nfunction buildAiCall(cfg, system, userText) {\n  const provider = String(cfg.AI_PROVIDER || 'gemini').toLowerCase();\n  if (provider === 'anthropic') {\n    return {\n      provider,\n      url: 'https://api.anthropic.com/v1/messages',\n      body: {\n        model: cfg.AI_MODEL || 'claude-opus-5-5',\n        max_tokens: 16000,\n        output_config: {\n          effort: cfg.AI_EFFORT || 'medium',\n          format: {\n            type: 'json_schema',\n            schema: {\n              type: 'object',\n              properties: Object.fromEntries(Object.entries(EMAIL_FIELDS).map(([k, d]) => [k, { type: 'string', description: d }])),\n              required: Object.keys(EMAIL_FIELDS),\n              additionalProperties: false,\n            },\n          },\n        },\n        fallbacks: 'default',\n        system,\n        messages: [{ role: 'user', content: userText }],\n      },\n    };\n  }\n  const model = cfg.AI_MODEL || 'gemini-4-hydrogen';\n  return {\n    provider: 'gemini',\n    url: `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent`,\n    body: {\n      systemInstruction: { parts: [{ text: system }] },\n      contents: [{ role: 'user', parts: [{ text: userText }] }],\n      generationConfig: {\n        temperature: 0.4,\n        maxOutputTokens: 8192,\n        responseMimeType: 'application/json',\n        responseSchema: {\n          type: 'OBJECT',\n          properties: Object.fromEntries(Object.entries(EMAIL_FIELDS).map(([k, d]) => [k, { type: 'STRING', description: d }])),\n          required: Object.keys(EMAIL_FIELDS),\n          propertyOrdering: Object.keys(EMAIL_FIELDS),\n        },\n      },\n    },\n  };\n}\n\n/**\n * Normalises either provider's response to { outcome, text, model, usage }.\n * outcome: 'ok' | 'refused' (policy/safety block: don't retry) | 'truncated' (hit the token limit) | 'empty'\n */\nfunction parseAiResponse(res) {\n  res = res || {};\n  if (Array.isArray(res.candidates) || res.promptFeedback) {\n    const c = (res.candidates || [])[0];\n    const model = res.modelVersion || 'gemini';\n    if (!c) {\n      return { outcome: res.promptFeedback && res.promptFeedback.blockReason ? 'refused' : 'empty', text: '', model, usage: res.usageMetadata || null };\n    }\n    const text = ((c.content && c.content.parts) || []).map((p) => p.text || '').join('');\n    const reason = c.finishReason || 'STOP';\n    let outcome = 'ok';\n    if (['SAFETY', 'RECITATION', 'BLOCKLIST', 'PROHIBITED_CONTENT', 'SPII'].includes(reason)) outcome = 'refused';\n    else if (reason === 'MAX_TOKENS') outcome = 'truncated';\n    else if (!text) outcome = 'empty';\n    return { outcome, text, model, usage: res.usageMetadata || null };\n  }\n  const text = (res.content || []).filter((b) => b.type === 'text').map((b) => b.text).join('');\n  let outcome = 'ok';\n  if (res.stop_reason === 'refusal') outcome = 'refused';\n  else if (res.stop_reason === 'max_tokens') outcome = 'truncated';\n  else if (!text) outcome = 'empty';\n  return { outcome, text, model: res.model || 'claude', usage: res.usage || null };\n}\n// ---- end ai.js ----\n// One retry: send the same facts again, with the validator's notes and the rejected draft.\n// This is a new single-turn request (not a follow-up turn), so the model gets a clean prompt.\nconst cfg = $('Config').first().json;\nconst ctxNode = $('Build Royalty Context').first().json;\nconst failed = $input.first().json;\nconst draft = typeof failed.draft === 'string' ? failed.draft : JSON.stringify(failed.draft || {}, null, 2);\nconst notes = (failed.problems || [failed.reason]).map((p) => `- ${p}`).join('\\n');\n\nconst userText = `${ctxNode.user_text}\n\nA previous draft of this email was rejected by our automated checks for these reasons:\n${notes}\n\n<rejected_draft>\n${draft}\n</rejected_draft>\n\nWrite a corrected email. Copy amounts, titles and dates exactly from the facts.`;\n\nconst call = buildAiCall(cfg, ctxNode.system, userText);\nreturn [{ json: { url: call.url, request: call.body, user_text: userText } }];\n"
+      },
+      "id": "6a336c3a-68fe-3faa-dbd3-17e127c9034a",
+      "name": "Build Retry Request",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1620,
+        520
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose"
+          },
+          "conditions": [
+            {
+              "id": "40e77c46-c51f-b554-d3f1-ff6bc6f71ff9",
+              "leftValue": "={{ $('Config').first().json.SEND_EMAIL }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "3c2dcd3a-1ef6-e2c2-0e14-7eae6d7ca980",
+      "name": "Send Real Email?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        2280,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "fromEmail": "={{ $('Config').first().json.EMAIL_FROM }}",
+        "toEmail": "={{ $json.recipient }}",
+        "subject": "={{ $json.subject }}",
+        "emailFormat": "text",
+        "text": "={{ $json.body }}",
+        "options": {
+          "appendAttribution": false
+        }
+      },
+      "id": "6d539611-95a5-a79d-6f3e-754383808bbe",
+      "name": "Send Email (SMTP)",
+      "type": "n8n-nodes-base.emailSend",
+      "typeVersion": 2.1,
+      "position": [
+        2500,
+        140
+      ],
+      "credentials": {
+        "smtp": {
+          "id": "REPLACE_ME",
+          "name": "SMTP account"
+        }
+      },
+      "retryOnFail": true,
+      "maxTries": 2,
+      "waitBetweenTries": 3000,
+      "onError": "continueErrorOutput"
+    },
+    {
+      "parameters": {
+        "jsCode": "// ---- inlined from n8n/src/lib/bubble.js ----\n/*\n * Helpers for the Bubble <-> n8n contract.\n *\n * Bubble's free plan blocks every inbound API call (Data API, Workflow API, CSV import), so n8n can't\n * read from or call back into Bubble. Instead:\n *   - Bubble sends the author's full data in the webhook body (normalizePayload reads it), and\n *   - n8n answers the same HTTP request with the result (summaryResponse builds it), and Bubble\n *     writes that result into the Notification Log itself.\n * Inlined into Code nodes by build-workflow.mjs, same as royalty.js.\n */\n\n/**\n * A date from Bubble → 'YYYY-MM-DD' as a calendar date in `timeZone`.\n * Bubble stores a moment in time; a date picked in India as 20 Jun is 19 Jun 18:30 UTC, so reading\n * it in UTC would shift it by a day. Accepts Unix milliseconds (Bubble's `:extract UNIX`), ISO strings\n * and plain 'YYYY-MM-DD'.\n */\nfunction localDate(value, timeZone) {\n  if (value === null || value === undefined || value === '') return null;\n  const s = String(value).trim();\n  if (/^\\d{4}-\\d{2}-\\d{2}$/.test(s)) return s;\n  const d = /^-?\\d{9,}$/.test(s) ? new Date(Number(s)) : new Date(s);\n  if (Number.isNaN(d.getTime())) return null;\n  const parts = new Intl.DateTimeFormat('en-CA', { timeZone: timeZone || 'UTC', year: 'numeric', month: '2-digit', day: '2-digit' })\n    .formatToParts(d);\n  const get = (t) => parts.find((p) => p.type === t).value;\n  return `${get('year')}-${get('month')}-${get('day')}`;\n}\n\n/** '' / null → null; '1,234' / '₹1234' / 1234 → 1234. */\nfunction toNum(v) {\n  if (v === null || v === undefined || v === '') return null;\n  if (typeof v === 'number') return Number.isFinite(v) ? v : null;\n  const n = Number(String(v).replace(/[₹,\\s]/g, ''));\n  return Number.isFinite(n) ? n : null;\n}\n\nconst txt = (v) => (v === null || v === undefined ? '' : String(v).trim());\n\n/** Bubble builds lists with :format as text, so a list may arrive as an array or as a JSON string. */\nfunction asArray(v) {\n  if (Array.isArray(v)) return v;\n  if (typeof v === 'string' && v.trim()) {\n    const s = v.trim();\n    try {\n      const parsed = JSON.parse(s.startsWith('[') ? s : `[${s}]`);\n      return Array.isArray(parsed) ? parsed : [parsed];\n    } catch (e) {\n      return null;\n    }\n  }\n  if (v === null || v === undefined || v === '') return [];\n  return null;\n}\n\nconst isBubbleId = (v) => typeof v === 'string' && /^\\d+x\\d+$/.test(v);\n\n/**\n * Reads and checks the webhook body sent by Bubble. Returns the author, books and payouts in the\n * same shape as bookleaf_sample_data.json, so lib/royalty.js works on them unchanged.\n *\n * Expected body (every value may be a string; Bubble's API Connector sends text):\n * {\n *   \"log_id\": \"<NotificationLog unique id>\", \"source\": \"single\" | \"bulk\",\n *   \"author\": { \"id\", \"author_code\", \"name\", \"email\", \"city\" },\n *   \"books\":   [ { \"book_code\", \"title\", \"isbn\", \"genre\", \"stage\", \"publication_date\", \"mrp\",\n *                  \"royalty_per_copy\", \"copies_sold\", \"royalty_earned\", \"royalty_paid\",\n *                  \"royalty_pending\", \"last_payout_date\", \"print_partner\", \"available_on\" } ],\n *   \"payouts\": [ { \"book_title\", \"amount\", \"payout_date\" } ]\n * }\n */\nfunction normalizePayload(body, timeZone) {\n  const errors = [];\n  body = body || {};\n  const a = body.author || {};\n\n  if (!isBubbleId(body.log_id)) errors.push('log_id must be a Bubble unique id');\n  if (!isBubbleId(a.id)) errors.push('author.id must be a Bubble unique id');\n  if (!txt(a.name)) errors.push('author.name is missing');\n  if (!/^[^@\\s]+@[^@\\s]+\\.[^@\\s]+$/.test(txt(a.email))) errors.push('author.email is missing or invalid');\n\n  const rawBooks = asArray(body.books);\n  const rawPayouts = asArray(body.payouts);\n  if (rawBooks === null) errors.push('books must be a list (JSON array)');\n  if (rawPayouts === null) errors.push('payouts must be a list (JSON array)');\n\n  const books = (rawBooks || []).map((b, i) => {\n    const book = {\n      book_id: txt(b.book_code) || null,\n      title: txt(b.title),\n      isbn: txt(b.isbn) || null,\n      genre: txt(b.genre) || null,\n      status: txt(b.stage),\n      publication_date: localDate(b.publication_date, timeZone),\n      mrp: toNum(b.mrp),\n      author_royalty_per_copy: toNum(b.royalty_per_copy),\n      total_copies_sold: toNum(b.copies_sold) ?? 0,\n      total_royalty_earned: toNum(b.royalty_earned) ?? 0,\n      royalty_paid: toNum(b.royalty_paid) ?? 0,\n      royalty_pending: toNum(b.royalty_pending) ?? 0,\n      last_royalty_payout_date: localDate(b.last_payout_date, timeZone),\n      print_partner: txt(b.print_partner) || null,\n      available_on: Array.isArray(b.available_on)\n        ? b.available_on.map(txt).filter(Boolean)\n        : txt(b.available_on).split(',').map((s) => s.trim()).filter(Boolean),\n    };\n    if (!book.title) errors.push(`books[${i}].title is missing`);\n    if (!book.status) errors.push(`books[${i}].stage is missing`);\n    // Guard against a broken Bubble expression sending mismatched money fields.\n    if (Math.abs(book.total_royalty_earned - book.royalty_paid - book.royalty_pending) > 1) {\n      errors.push(`books[${i}] (${book.title}): earned ≠ paid + pending`);\n    }\n    return book;\n  });\n\n  const payouts = (rawPayouts || []).map((p) => ({\n    amount: toNum(p.amount) ?? 0,\n    payout_date: localDate(p.payout_date, timeZone),\n    book_title: txt(p.book_title) || null,\n  }));\n\n  return {\n    errors,\n    log_id: body.log_id || null,\n    source: body.source === 'bulk' ? 'bulk' : 'single',\n    author: { bubble_id: a.id || null, author_id: txt(a.author_code) || null, name: txt(a.name), email: txt(a.email).toLowerCase(), city: txt(a.city) || null },\n    books,\n    payouts,\n  };\n}\n\n/**\n * The one response shape n8n returns to Bubble, for every outcome. Every key is always present\n * (empty string / false when unused) so Bubble's API Connector detects all fields when the call is\n * initialised, and the Bubble workflow can copy them into the Notification Log one to one.\n */\nfunction summaryResponse(fields) {\n  const base = {\n    ok: false,\n    status: 'Failed',            // Success | Failed | Skipped\n    log_id: '',\n    email_subject: '',\n    email_body: '',\n    email_sent: false,\n    recipient: '',\n    error_message: '',\n    failed_step: '',\n    ai_model: '',\n    n8n_execution_id: '',\n    completed_at: new Date().toISOString(),\n  };\n  for (const [k, v] of Object.entries(fields || {})) {\n    if (v !== undefined && v !== null && k in base) base[k] = typeof base[k] === 'string' ? String(v) : v;\n  }\n  return base;\n}\n// ---- end bubble.js ----\n// Steps 4 + 5: the result Bubble writes into the Notification Log (status, timestamp, the email).\nconst v = $('Validate Payload').first().json;\nconst email = $('Parse & Validate Email').last().json;\nconst sent = $('Send Email (SMTP)').isExecuted;\n\nreturn [{\n  json: {\n    response: summaryResponse({\n      ok: true,\n      status: 'Success',\n      log_id: v.log_id,\n      email_subject: email.subject,\n      email_body: email.body,\n      email_sent: sent,\n      recipient: sent ? email.recipient : email.intended_recipient,\n      ai_model: email.model,\n      n8n_execution_id: v.execution_id,\n      completed_at: new Date().toISOString(),\n    }),\n  },\n}];\n"
+      },
+      "id": "927a473a-8d97-e295-d6c6-e856e4685182",
+      "name": "Prepare Success Response",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2720,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ JSON.stringify($json.response) }}",
+        "options": {
+          "responseCode": 200
+        }
+      },
+      "id": "5039a515-d28b-5e0e-3786-f0d34cc5b5b9",
+      "name": "Respond: Success",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [
+        2940,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// ---- inlined from n8n/src/lib/bubble.js ----\n/*\n * Helpers for the Bubble <-> n8n contract.\n *\n * Bubble's free plan blocks every inbound API call (Data API, Workflow API, CSV import), so n8n can't\n * read from or call back into Bubble. Instead:\n *   - Bubble sends the author's full data in the webhook body (normalizePayload reads it), and\n *   - n8n answers the same HTTP request with the result (summaryResponse builds it), and Bubble\n *     writes that result into the Notification Log itself.\n * Inlined into Code nodes by build-workflow.mjs, same as royalty.js.\n */\n\n/**\n * A date from Bubble → 'YYYY-MM-DD' as a calendar date in `timeZone`.\n * Bubble stores a moment in time; a date picked in India as 20 Jun is 19 Jun 18:30 UTC, so reading\n * it in UTC would shift it by a day. Accepts Unix milliseconds (Bubble's `:extract UNIX`), ISO strings\n * and plain 'YYYY-MM-DD'.\n */\nfunction localDate(value, timeZone) {\n  if (value === null || value === undefined || value === '') return null;\n  const s = String(value).trim();\n  if (/^\\d{4}-\\d{2}-\\d{2}$/.test(s)) return s;\n  const d = /^-?\\d{9,}$/.test(s) ? new Date(Number(s)) : new Date(s);\n  if (Number.isNaN(d.getTime())) return null;\n  const parts = new Intl.DateTimeFormat('en-CA', { timeZone: timeZone || 'UTC', year: 'numeric', month: '2-digit', day: '2-digit' })\n    .formatToParts(d);\n  const get = (t) => parts.find((p) => p.type === t).value;\n  return `${get('year')}-${get('month')}-${get('day')}`;\n}\n\n/** '' / null → null; '1,234' / '₹1234' / 1234 → 1234. */\nfunction toNum(v) {\n  if (v === null || v === undefined || v === '') return null;\n  if (typeof v === 'number') return Number.isFinite(v) ? v : null;\n  const n = Number(String(v).replace(/[₹,\\s]/g, ''));\n  return Number.isFinite(n) ? n : null;\n}\n\nconst txt = (v) => (v === null || v === undefined ? '' : String(v).trim());\n\n/** Bubble builds lists with :format as text, so a list may arrive as an array or as a JSON string. */\nfunction asArray(v) {\n  if (Array.isArray(v)) return v;\n  if (typeof v === 'string' && v.trim()) {\n    const s = v.trim();\n    try {\n      const parsed = JSON.parse(s.startsWith('[') ? s : `[${s}]`);\n      return Array.isArray(parsed) ? parsed : [parsed];\n    } catch (e) {\n      return null;\n    }\n  }\n  if (v === null || v === undefined || v === '') return [];\n  return null;\n}\n\nconst isBubbleId = (v) => typeof v === 'string' && /^\\d+x\\d+$/.test(v);\n\n/**\n * Reads and checks the webhook body sent by Bubble. Returns the author, books and payouts in the\n * same shape as bookleaf_sample_data.json, so lib/royalty.js works on them unchanged.\n *\n * Expected body (every value may be a string; Bubble's API Connector sends text):\n * {\n *   \"log_id\": \"<NotificationLog unique id>\", \"source\": \"single\" | \"bulk\",\n *   \"author\": { \"id\", \"author_code\", \"name\", \"email\", \"city\" },\n *   \"books\":   [ { \"book_code\", \"title\", \"isbn\", \"genre\", \"stage\", \"publication_date\", \"mrp\",\n *                  \"royalty_per_copy\", \"copies_sold\", \"royalty_earned\", \"royalty_paid\",\n *                  \"royalty_pending\", \"last_payout_date\", \"print_partner\", \"available_on\" } ],\n *   \"payouts\": [ { \"book_title\", \"amount\", \"payout_date\" } ]\n * }\n */\nfunction normalizePayload(body, timeZone) {\n  const errors = [];\n  body = body || {};\n  const a = body.author || {};\n\n  if (!isBubbleId(body.log_id)) errors.push('log_id must be a Bubble unique id');\n  if (!isBubbleId(a.id)) errors.push('author.id must be a Bubble unique id');\n  if (!txt(a.name)) errors.push('author.name is missing');\n  if (!/^[^@\\s]+@[^@\\s]+\\.[^@\\s]+$/.test(txt(a.email))) errors.push('author.email is missing or invalid');\n\n  const rawBooks = asArray(body.books);\n  const rawPayouts = asArray(body.payouts);\n  if (rawBooks === null) errors.push('books must be a list (JSON array)');\n  if (rawPayouts === null) errors.push('payouts must be a list (JSON array)');\n\n  const books = (rawBooks || []).map((b, i) => {\n    const book = {\n      book_id: txt(b.book_code) || null,\n      title: txt(b.title),\n      isbn: txt(b.isbn) || null,\n      genre: txt(b.genre) || null,\n      status: txt(b.stage),\n      publication_date: localDate(b.publication_date, timeZone),\n      mrp: toNum(b.mrp),\n      author_royalty_per_copy: toNum(b.royalty_per_copy),\n      total_copies_sold: toNum(b.copies_sold) ?? 0,\n      total_royalty_earned: toNum(b.royalty_earned) ?? 0,\n      royalty_paid: toNum(b.royalty_paid) ?? 0,\n      royalty_pending: toNum(b.royalty_pending) ?? 0,\n      last_royalty_payout_date: localDate(b.last_payout_date, timeZone),\n      print_partner: txt(b.print_partner) || null,\n      available_on: Array.isArray(b.available_on)\n        ? b.available_on.map(txt).filter(Boolean)\n        : txt(b.available_on).split(',').map((s) => s.trim()).filter(Boolean),\n    };\n    if (!book.title) errors.push(`books[${i}].title is missing`);\n    if (!book.status) errors.push(`books[${i}].stage is missing`);\n    // Guard against a broken Bubble expression sending mismatched money fields.\n    if (Math.abs(book.total_royalty_earned - book.royalty_paid - book.royalty_pending) > 1) {\n      errors.push(`books[${i}] (${book.title}): earned ≠ paid + pending`);\n    }\n    return book;\n  });\n\n  const payouts = (rawPayouts || []).map((p) => ({\n    amount: toNum(p.amount) ?? 0,\n    payout_date: localDate(p.payout_date, timeZone),\n    book_title: txt(p.book_title) || null,\n  }));\n\n  return {\n    errors,\n    log_id: body.log_id || null,\n    source: body.source === 'bulk' ? 'bulk' : 'single',\n    author: { bubble_id: a.id || null, author_id: txt(a.author_code) || null, name: txt(a.name), email: txt(a.email).toLowerCase(), city: txt(a.city) || null },\n    books,\n    payouts,\n  };\n}\n\n/**\n * The one response shape n8n returns to Bubble, for every outcome. Every key is always present\n * (empty string / false when unused) so Bubble's API Connector detects all fields when the call is\n * initialised, and the Bubble workflow can copy them into the Notification Log one to one.\n */\nfunction summaryResponse(fields) {\n  const base = {\n    ok: false,\n    status: 'Failed',            // Success | Failed | Skipped\n    log_id: '',\n    email_subject: '',\n    email_body: '',\n    email_sent: false,\n    recipient: '',\n    error_message: '',\n    failed_step: '',\n    ai_model: '',\n    n8n_execution_id: '',\n    completed_at: new Date().toISOString(),\n  };\n  for (const [k, v] of Object.entries(fields || {})) {\n    if (v !== undefined && v !== null && k in base) base[k] = typeof base[k] === 'string' ? String(v) : v;\n  }\n  return base;\n}\n// ---- end bubble.js ----\n// Shared failure handler. Every step after the idempotency gate sends its error output here.\n// It works out which step failed, releases the per-author lock so the admin can retry right away,\n// and answers Bubble with status \"Failed\" and a readable reason. The run then ends with\n// Stop and Error, so the execution also shows as failed in n8n (and the error workflow alerts ops).\nconst v = $('Validate Payload').first().json;\nconst input = $input.first().json;\n\n// The flow is linear, so the last step that ran is the one that failed.\nconst STEPS = ['Build Royalty Context', 'AI: Generate Email', 'Parse & Validate Email', 'Send Email (SMTP)'];\nconst ran = (name) => { try { return $(name).isExecuted; } catch (e) { return false; } };\nconst failedStep = [...STEPS].reverse().find(ran) || 'Unknown step';\n\nconst FRIENDLY = {\n  'Build Royalty Context': 'Could not prepare the royalty data',\n  'AI: Generate Email': 'The AI service did not respond successfully',\n  'Parse & Validate Email': 'The AI-generated email did not pass the checks',\n  'Send Email (SMTP)': 'The email was generated but could not be delivered over SMTP',\n};\n\nconst err = input.error;\nlet reason = input.reason\n  || (err && (err.description || err.message))\n  || (typeof err === 'string' ? err : null)\n  || 'Unknown error';\nif (err && err.httpCode) reason = `HTTP ${err.httpCode}: ${reason}`;\nconst errorMessage = `${FRIENDLY[failedStep] || 'Step failed'}. ${reason}`.slice(0, 1000);\n\n// A failed run should not block an immediate retry (a retry click creates a new log_id).\nconst store = $getWorkflowStaticData('global');\nif (store.locks && v.author) delete store.locks[v.author.bubble_id];\n\n// If the email was generated before the failure (for example SMTP failed), keep it in the log.\nlet email = null;\nif (ran('Parse & Validate Email')) {\n  const parsed = $('Parse & Validate Email').last().json;\n  if (parsed && parsed.ok) email = parsed;\n}\n\nreturn [{\n  json: {\n    failed_step: failedStep,\n    error_message: errorMessage,\n    response: summaryResponse({\n      status: 'Failed',\n      log_id: v.log_id,\n      failed_step: failedStep,\n      error_message: errorMessage,\n      email_subject: email ? email.subject : '',\n      email_body: email ? email.body : '',\n      email_sent: false,\n      recipient: email ? email.intended_recipient : '',\n      n8n_execution_id: v.execution_id,\n      completed_at: new Date().toISOString(),\n    }),\n  },\n}];\n"
+      },
+      "id": "abceaf3e-9bd6-93cf-53b4-f874c3756837",
+      "name": "Build Failure Response",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1840,
+        760
+      ]
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ JSON.stringify($json.response) }}",
+        "options": {
+          "responseCode": 200
+        }
+      },
+      "id": "e3f462da-ffda-f29c-7812-e2d2802aa8ea",
+      "name": "Respond: Failed",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [
+        2060,
+        760
+      ]
+    },
+    {
+      "parameters": {
+        "errorMessage": "={{ \"Royalty summary failed at \\\"\" + $(\"Build Failure Response\").first().json.failed_step + \"\\\": \" + $(\"Build Failure Response\").first().json.error_message }}"
+      },
+      "id": "e1593bb5-1543-4a46-0fa4-3bd741c47970",
+      "name": "Stop: Mark Execution Failed",
+      "type": "n8n-nodes-base.stopAndError",
+      "typeVersion": 1,
+      "position": [
+        2280,
+        760
+      ]
+    }
+  ],
+  "connections": {
+    "Webhook": {
+      "main": [
+        [
+          {
+            "node": "Config",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Config": {
+      "main": [
+        [
+          {
+            "node": "Validate Payload",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Validate Payload": {
+      "main": [
+        [
+          {
+            "node": "Payload Valid?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Payload Valid?": {
+      "main": [
+        [
+          {
+            "node": "Idempotency Gate",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Respond: Bad Payload (Failed)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Idempotency Gate": {
+      "main": [
+        [
+          {
+            "node": "Proceed?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Proceed?": {
+      "main": [
+        [
+          {
+            "node": "Build Royalty Context",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Respond: Duplicate (Skipped)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Royalty Context": {
+      "main": [
+        [
+          {
+            "node": "AI: Generate Email",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Build Failure Response",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "AI: Generate Email": {
+      "main": [
+        [
+          {
+            "node": "Parse & Validate Email",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Build Failure Response",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Parse & Validate Email": {
+      "main": [
+        [
+          {
+            "node": "Email Valid?",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Build Failure Response",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Email Valid?": {
+      "main": [
+        [
+          {
+            "node": "Send Real Email?",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Retry AI?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Retry AI?": {
+      "main": [
+        [
+          {
+            "node": "Build Retry Request",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Build Failure Response",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Retry Request": {
+      "main": [
+        [
+          {
+            "node": "AI: Generate Email",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Send Real Email?": {
+      "main": [
+        [
+          {
+            "node": "Send Email (SMTP)",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Prepare Success Response",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Send Email (SMTP)": {
+      "main": [
+        [
+          {
+            "node": "Prepare Success Response",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Build Failure Response",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Prepare Success Response": {
+      "main": [
+        [
+          {
+            "node": "Respond: Success",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Failure Response": {
+      "main": [
+        [
+          {
+            "node": "Respond: Failed",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Respond: Failed": {
+      "main": [
+        [
+          {
+            "node": "Stop: Mark Execution Failed",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1",
+    "saveManualExecutions": true,
+    "callerPolicy": "workflowsFromSameOwner"
+  },
+  "pinData": {},
+  "meta": {
+    "templateCredsSetupCompleted": false
+  },
+  "tags": []
+}

@@ -1,0 +1,87 @@
+{
+  "name": "BookLeaf: Workflow Error Alerts",
+  "nodes": [
+    {
+      "parameters": {},
+      "id": "6e016da0-832d-36c2-792d-7df731ec6351",
+      "name": "Error Trigger",
+      "type": "n8n-nodes-base.errorTrigger",
+      "typeVersion": 1,
+      "position": [
+        0,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Build a short alert from the failed execution.\nconst e = $input.first().json;\nconst ex = e.execution || {};\nreturn [{ json: {\n  subject: `[n8n] ${e.workflow?.name || \"Workflow\"} failed`,\n  text: [\n    `Workflow: ${e.workflow?.name}`,\n    `Execution: ${ex.id} (${ex.mode})`,\n    `Last node: ${ex.lastNodeExecuted}`,\n    `Error: ${ex.error?.message}`,\n    `Open: ${ex.url || \"n/a\"}`,\n  ].join(\"\\n\"),\n} }];"
+      },
+      "id": "016290b4-b9ce-de1b-cd20-4ec4cfec6e22",
+      "name": "Format Alert",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        220,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "fromEmail": "n8n alerts <alerts@example.com>",
+        "toEmail": "ops@example.com",
+        "subject": "={{ $json.subject }}",
+        "emailFormat": "text",
+        "text": "={{ $json.text }}",
+        "options": {
+          "appendAttribution": false
+        }
+      },
+      "id": "9d1ef354-817f-bd5d-d6c5-d6509b9f50c0",
+      "name": "Email Ops Team",
+      "type": "n8n-nodes-base.emailSend",
+      "typeVersion": 2.1,
+      "position": [
+        440,
+        300
+      ],
+      "credentials": {
+        "smtp": {
+          "id": "REPLACE_ME",
+          "name": "SMTP account"
+        }
+      },
+      "disabled": true,
+      "notes": "Enable after adding SMTP credentials. Until then the alert is visible in this workflow's executions."
+    }
+  ],
+  "connections": {
+    "Error Trigger": {
+      "main": [
+        [
+          {
+            "node": "Format Alert",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Format Alert": {
+      "main": [
+        [
+          {
+            "node": "Email Ops Team",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "pinData": {},
+  "tags": []
+}
