@@ -304,14 +304,26 @@ Code-node logic lives in `n8n/src`. Edit it there, run `npm test && npm run buil
 - **Testing n8n Code nodes.** Debugging JavaScript inside the n8n editor is slow, so the Code-node logic lives in normal files with unit tests, and a build script inlines it into the workflow JSON. A second test suite runs the *built* nodes with a mocked n8n runtime: happy path, both providers, duplicates, AI retry, safety blocks and failure responses.
 
 ### Learning log
-> *(Add your own notes here: which Bubble concepts took longest (privacy rules, "Current cell", the conditional order, the API Connector's initialize step, custom states), what surprised you about the free plan, which manual pages or videos helped, and how you used AI tools while building. The founders said they want to see this.)*
+Bubble was new to me. Roughly how the week went:
+
+- **Day 1: data model first.** Option sets, then the five data types, then privacy rules. The idea that privacy rules are enforced on Bubble's server (not by filtering on the page) took a moment to click, but it made the author dashboard simpler: its searches don't filter by user at all, and Kavita still only sees her two books.
+- **The free plan surprises.** My seed script failed with "This application does not expose an API", then CSV upload turned out to be paid too. That cost a few hours and forced two changes: entering the records by hand from a generated sheet ([data/manual_entry.txt](data/manual_entry.txt)), and redesigning the n8n integration from callback to request/response.
+- **Things that tripped me up in the editor:**
+  - In conditionals, **the last matching one wins**, so the badge conditions have to be added in a specific order.
+  - **An empty date compared with `<` counts as true**: every author showed "Overdue" until I added "is not empty" to the condition.
+  - A reusable element can't be dropped inside itself (I did that once by editing the reusable instead of the page).
+  - The API Connector wraps the response in `body` when "Include errors in response" is on.
+  - A custom event can't schedule itself, so the bulk loop hops through a second "relay" event.
+- **Logins.** "Create an account for someone else" + "Assign a temp password" was new to me. I lost the first temp passwords and had to recreate the logins, which is why the test author is Kavita.
+- **How I used AI tools.** I used Claude in VS Code to plan the schema, write and test the n8n Code-node logic, and write the docs, and the Claude Chrome extension to do repetitive editor clicking (adding ~60 fields, styles, long expressions). The extension is slow, so for later pages I built parts myself with step-by-step guidance, and I checked and tested every step in the running app. I can explain each workflow and node.
+- **What I'd do differently:** check the plan limits before designing the integration, and build the pages simply first and style them last.
 
 ---
 
 ## Submission details
 - Live app: `https://shrivaskajal2002.bubbleapps.io/version-test`
-- Author login: `kavita.deshmukh@email.com` / `<password>`
-- Admin login: `admin@bookleaf.test` / `<password>`
+- Author login: `kavita.deshmukh@email.com` (password sent by email)
+- Admin login: `admin@bookleaf.test` (password sent by email)
 - Bubble editor: free plan, so no collaborator invite; live URL and test logins as agreed by email
 - n8n: workflow JSON in `n8n/`; production webhook `https://kajalshrivas.app.n8n.cloud/webhook/bookleaf-royalty-summary` (key-protected)
-- Screen recording: `<Loom link>`
+- Screen recording: https://drive.google.com/file/d/1j5qCRjKPBgK9u8AjgPmCnPKEzHplQBI_/view?usp=sharing

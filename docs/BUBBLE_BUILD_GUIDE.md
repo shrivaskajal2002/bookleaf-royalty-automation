@@ -1,5 +1,7 @@
 # Bubble Build Guide: BookLeaf Royalty Dashboard
 
+> **Free-plan update (read first).** This guide was written for the original design. On Bubble's free plan the Data API, Workflow API and CSV upload are blocked, so the built app differs in three places: **§5–6** (n8n is called through the API Connector with the author's full data and replies in the same request; there is no backend callback workflow), **§7.1** (records were entered in App data from [data/manual_entry.txt](../data/manual_entry.txt) instead of the seed script), and **Settings → API** (no token needed). The current integration is described in the [README §3 and §5](../README.md). Sections 1–4 and 8–9 match the app.
+
 A step-by-step guide to building the Bubble side of the system: database, privacy rules, API Connector, backend workflow, pages and workflows. Each step tells you what to click and what to type. Field and type names must match exactly, because the n8n workflow and the seed script use them.
 
 Build in this order. Each step depends on the ones before it.
