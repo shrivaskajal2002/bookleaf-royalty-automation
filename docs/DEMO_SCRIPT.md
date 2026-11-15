@@ -1,21 +1,54 @@
-# Screen recording script (target: 4 minutes)
+# Screen recording script (about 4 minutes)
 
-Before recording: n8n workflow **active**, Bubble data seeded, logins created, one browser window for Bubble and one for n8n (*Executions* tab open). Use a normal window for admin and a private window for the author.
+**Tool:** Loom (free, up to 5 min, gives a share link) or Windows Snipping Tool (Win + Shift + R, then upload the MP4 to Google Drive as "Anyone with the link").
 
-| Time | Screen | Show | Say (short) |
-|---|---|---|---|
-| 0:00 | README diagram | the architecture | "Bubble is the app, n8n does the automation, Claude writes the email. Bubble sends only ids, and n8n reads everything from Bubble." |
-| 0:20 | Bubble editor → Data | data types and option sets, Book's `overdue_on` | "Authors have books, books have payouts. Statuses are option sets. 'Overdue' is stored as a date, so it never goes stale." |
-| 0:45 | Data → Privacy | the Owner and Admins rules on Book | "Authors can only see records whose owner_user is them. Logs are admin-only." |
-| 1:00 | Private window: log in as Priya | dashboard: summary cards, book table, badges, payout history | "Two books, one paid up (green), one overdue (red), totals at the top." |
-| 1:30 | Same window: open `/admin` | redirected to the login page | "An author can't open admin pages, and the privacy rules return nothing else anyway." |
-| 1:40 | Admin window | author list. Filter **Overdue**, then city **Nagpur**, then search "Rohit" | "Totals are cached on Author, so these filters are one database search." |
-| 2:05 | Rohit's detail page | click **Generate & Send**. Double-click to show the second click is blocked. | "The log is created as Queued first. n8n answers in a second, so no spinner." |
-| 2:20 | n8n Executions | the run going green node by node. Open *Build Royalty Context* output (the facts) and *Claude* output | "All maths is done here in code. Claude only writes the wording, and the validator checks every rupee amount against the data." |
-| 2:55 | Bubble log | row goes Processing → Success. Click **View email** and read the overdue paragraph. | "Personal greeting, each book, totals, an apology for the overdue payout with a 48-hour follow-up." |
-| 3:20 | Kavita (optional) | send, open the email | "Below the ₹1,000 minimum: it rolls over. Plus the update on the book in typesetting." |
-| 3:35 | n8n: break the Claude credential, send again | log row → **Failed**: "Claude: Generate Email – HTTP 401" | "Every step after the 202 has an error branch that reports Failed to Bubble with the step name." |
-| 3:50 | Admin: **Bulk** button | progress counter, log filling up | "Same webhook, once per author with pending royalties: nine authors." |
-| 4:10 | end | – | – |
+**Before recording:** close the Claude side panel, Notepad and anything showing passwords or keys. Zoom the browser to 90%. Open three tabs:
+1. Incognito: `https://shrivaskajal2002.bubbleapps.io/version-test/index` (logged out)
+2. n8n: the workflow, **Editor** tab
+3. n8n: the same workflow, **Executions** tab
 
-Restore the Claude credential after the failure demo.
+---
+
+## 0:00 Intro (15 s)
+> "Hi, I'm Kajal. This is my BookLeaf Royalty Dashboard, built in Bubble with n8n and an AI model. I'll show the author portal, the admin portal, a royalty summary being generated, and the n8n workflow."
+
+## 0:15 Author portal (45 s)
+- Log in as `kavita.deshmukh@email.com`.
+> "Authors log in with email and password. Kavita sees only her own two books. That's enforced by Bubble privacy rules on the server, not just a page filter."
+- Point at the cards and the badges.
+> "The summary shows total earned, paid and pending. Each book has a status badge. This one is Pending, because ₹850 is under the ₹1,000 payout minimum, so it rolls over and isn't overdue. This one is In production."
+- Log out.
+
+## 1:00 Admin portal (45 s)
+- Log in as `admin@bookleaf.test`.
+> "The admin sees every author with total books, earnings and pending payouts."
+- Status filter → Overdue, then a city, then type a name in search, then clear.
+> "I can filter by payout status and city, and search by name."
+- Click **Sneha Kulkarni**.
+> "The detail page shows the same data the author sees: books, royalties and payout history."
+
+## 1:45 Generate & Send (60 s)
+- Click **Generate & Send Royalty Summary**.
+> "This creates a notification log entry and calls my n8n webhook, protected with a secret header. While it runs, the button shows Sending… and can't be clicked twice."
+- Switch to the n8n **Executions** tab and refresh.
+> "In n8n the workflow validates the data, calculates every figure in code, asks the AI to write the email, then checks that every amount in the email matches the data."
+- Back to the admin page → **Notification log**.
+> "It came back as Success, with the email. This Skipped row is the duplicate protection from when I clicked twice."
+
+## 2:45 Bulk (25 s)
+- Click **Send summaries to all pending**.
+> "The bulk button sends a summary to every author with pending royalties. It calls the same webhook once per author, one at a time."
+- Show one or two new rows appearing (no need to wait for all of them).
+
+## 3:10 n8n workflow tour (50 s)
+- n8n **Editor** tab; move across the canvas left to right.
+> "Section 1 is security and intake: header auth, payload validation, and an idempotency gate that skips duplicates. Section 2 builds the royalty facts in code, including the quarterly cycle and 45-day window. The AI only writes the wording as JSON; a validator checks it and retries once if needed. Section 3 is failure handling: any error returns Failed with the step name, and the run is marked failed in n8n, so nothing fails silently."
+
+## 4:00 Wrap-up (15 s)
+> "One note: Bubble's free plan blocks inbound API calls, so instead of a callback, n8n replies in the same request and Bubble writes the result to the log. The README on GitHub explains the design. Thank you!"
+
+---
+
+**Tips**
+- The AI takes about 30–40 seconds. Fill that time with the n8n Executions tab.
+- If a run shows Failed (503 overloaded), keep going: "Here the free AI tier was overloaded, and the error is logged clearly." That shows the error handling working.
